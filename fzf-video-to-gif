@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# fzf-video-to-gif:summary=Convert video segment to high-quality GIF via fzf.
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/fzf-fftools-lib"
+
+require_tools ffmpeg || exit 1
+
+if [[ $# -gt 0 ]]; then
+    video="$1"
+else
+    require_tools fzf fd || exit 1
+    video=$(pick_video) || exit 0
+    [[ -z "$video" ]] && exit 0
+fi
+
+read -r -p "开始时间 (如 00:00:05, 留空=从头): " ss
+read -r -p "持续时长/秒 (如 5): " t
+
+scale=$(printf '480p (适合聊天)\n原始分辨率\n360p (小巧)' \
+    | fzf "${FZF_BASE[@]}" --height 30% --header '输出尺寸') || exit 0
+[[ -z "$scale" ]] && exit 0
+
+fps=$(printf '10 fps (标准)\n15 fps (流畅)\n24 fps (原帧率)' \
+    | fzf "${FZF_BASE[@]}" --height 30% --header '帧率') || exit 0
+[[ -z "$fps" ]] && exit 0
+
+output="${video%.*}.gif"
+read -r -p "输出 [$output]: " custom
+output="${custom:-$output}"
+
+ss_args=(); [[ -n "$ss" ]] && ss_args=(-ss "$ss")
+t_args=();  [[ -n "$t" ]] && t_args=(-t "$t")
+
+case "${scale%% *}" in
+    480p) vf="scale=480:-1:flags=lanczos," ;;
+    360p) vf="scale=360:-1:flags=lanczos," ;;
+    *)    vf="" ;;
+esac
+fps_val=$(echo "$fps" | grep -oP '\d+')
+
+palette=$(mktemp /tmp/palette_XXXXXX.png)
+trap 'rm -f -- "$palette"' EXIT
+
+printf '生成调色板...\n'
+ffmpeg "${ss_args[@]}" "${t_args[@]}" -i "$video" \
+    -vf "${vf}fps=$fps_val,palettegen=stats_mode=diff" -y "$palette" || { echo "❌ 失败"; exit 1; }
+printf '编码 GIF...\n'
+fftools_run ffmpeg "${ss_args[@]}" "${t_args[@]}" -i "$video" -i "$palette" \
+    -lavfi "${vf}fps=$fps_val[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=5" -y "$output"

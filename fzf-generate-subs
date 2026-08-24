@@ -1,0 +1,898 @@
+
+#!/usr/bin/env bash
+# fzf-generate-subs:summary=用 Whisper 批量生成字幕，可选翻译(Whisper原生/Ollama)，双语字幕
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/fzf-fftools-lib"
+
+require_tools whisper-cli fzf fd || exit 1
+
+# ── 自动检测 CPU 线程数 ─────────────────────────────────────
+CPU_THREADS=$(nproc 2>/dev/null || echo 4)
+
+# ── Whisper VAD 模型 ─────────────────────────────────────────
+# whisper.cpp --vad 使用 Silero VAD GGML 模型
+detect_vad_model() {
+    local search_dirs=(
+        "${XDG_DATA_HOME:-$HOME/.local/share}/models"
+        "$HOME/.local/share/models"
+        "/usr/share/whisper.cpp/models"
+        "/usr/share/whisper.cpp"
+        "/usr/share"
+    )
+    local directory model
+
+    for directory in "${search_dirs[@]}"; do
+        [[ -d "$directory" ]] || continue
+        model=$(fd --max-depth 2 --type f 'ggml-silero.*\.bin$' "$directory" 2>/dev/null | head -1 || true)
+        [[ -n "$model" ]] && {
+            printf '%s\n' "$model"
+            return 0
+        }
+    done
+    return 1
+}
+
+VAD_MODEL=$(detect_vad_model || true)
+
+if [[ -z "$VAD_MODEL" ]]; then
+    printf '⚠ 未找到 Silero VAD 模型。\n'
+    printf '  已检查 ~/.local/share/models 和 /usr/share 下的常见目录。\n'
+    printf '  VAD 将在本次运行中自动禁用。\n\n'
+    VAD_AVAILABLE=false
+else
+    printf '✓ VAD 模型: %s\n' "$VAD_MODEL"
+    VAD_AVAILABLE=true
+fi
+
+# ── 自动检测已安装的 Whisper 模型 ──────────────────────────
+WHISPER_MODEL_DIR="/usr/share"
+
+detect_whisper_models() {
+    local models=()
+
+    for d in "$WHISPER_MODEL_DIR"/whisper.cpp-model-*; do
+        [[ -d "$d" ]] || continue
+
+        for bin in "$d"/ggml-*.bin; do
+            [[ -f "$bin" ]] || continue
+
+            local name
+            name=$(basename -- "$bin" .bin)
+            models+=("$bin|$name")
+        done
+    done
+
+    printf '%s\n' "${models[@]}"
+}
+
+# ── 处理模式选择 ─────────────────────────────────────────────
+mode=$(printf '%s\n' \
+    "single  单个文件处理" \
+    "batch   批量处理（多文件）" \
+| fzf "${FZF_BASE[@]}" --height 20% --header "处理模式") || exit 0
+
+case "$mode" in
+    batch*)
+        files=$(pick_multi_with_preview \
+            '选择文件 · Tab 多选 · Ctrl-A 全选' \
+            <<< "$(media_candidates '\.(mp4|mkv|mov|avi|webm|ts|m4v|flv|mpeg|mpg|wmv|3gp|mp3|flac|wav|aac|m4a|opus|ogg|wma|ac3|aiff|ape)$')") \
+            || exit 0
+
+        [[ -z "$files" ]] && exit 0
+
+        mapfile -t FILE_LIST <<< "$files"
+        ;;
+    *)
+        FILE_LIST=()
+
+        media=$(pick_media) || exit 0
+        [[ -z "$media" ]] && exit 0
+
+        FILE_LIST=("$media")
+        ;;
+esac
+
+# ── 模型选择 ──────────────────────────────────────────────
+model_map=$(detect_whisper_models)
+# grep -c 无匹配时已输出 0 但退出码为 1，pipefail 下再 || echo 0 会得到 "0\n0"
+model_count=$(echo "$model_map" | grep -c '|' 2>/dev/null || true)
+
+if (( model_count <= 1 )); then
+    # 只有一个模型，直接使用
+    WHISPER_MODEL=$(echo "$model_map" | head -1 | cut -d'|' -f1)
+else
+    selected=$(echo "$model_map" | cut -d'|' -f2 |
+        fzf "${FZF_BASE[@]}" --height 30% --header "Whisper 模型") || exit 0
+
+    WHISPER_MODEL=$(echo "$model_map" |
+        grep "|${selected}$" |
+        head -1 |
+        cut -d'|' -f1)
+fi
+
+[[ -z "$WHISPER_MODEL" ]] && {
+    printf '未找到 Whisper 模型\n' >&2
+    exit 1
+}
+
+# ── 源语言选择 ────────────────────────────────────────────
+lang=$(printf '%s\n' \
+    "auto         自动检测" \
+    "zh           中文" \
+    "en           English" \
+    "ja           日本語" \
+    "ko           한국어" \
+    "fr           Français" \
+    "de           Deutsch" \
+    "es           Español" \
+    "ru           Русский" \
+    "pt           Português" \
+    "ar           العربية" \
+    "it           Italiano" \
+    "th           ไทย" \
+    "vi           Tiếng Việt" \
+    "custom       自定义输入" \
+| fzf "${FZF_BASE[@]}" --height 40% --header "源语言") || exit 0
+
+case "$lang" in
+    auto*)
+        lang_code="auto"
+        ;;
+    custom*)
+        read -r -p "语言代码: " lang_code
+        lang_code="${lang_code:-auto}"
+        ;;
+    *)
+        lang_code=$(echo "$lang" | awk '{print $1}')
+        ;;
+esac
+
+# ── 输出格式 ───────────────────────────────────────────────
+fmt=$(printf '%s\n' \
+    "srt   SRT 字幕 (通用)" \
+    "vtt   WebVTT (网页)" \
+    "lrc   LRC 歌词" \
+    "txt   纯文本" \
+| fzf "${FZF_BASE[@]}" --height 30% --header "字幕输出格式") || exit 0
+
+fmt_ext=$(echo "$fmt" | awk '{print $1}')
+
+# ── Whisper 预设 ───────────────────────────────────────────
+# VAD 会拼接离散语音段，适合连续谈话；复杂或非语言音频建议使用 balanced/robust。
+default_desc="balanced   通用平衡 (原始时间轴 + 非语音抑制 + GPU)"
+
+adv=$(printf '%s\n' \
+    "$default_desc" \
+    "fast-vad   连续谈话快速处理 (需要 Silero VAD 模型)" \
+    "robust     非语音/重复幻觉较多的素材 (禁用回退和上下文)" \
+    "custom      自定义参数" \
+| fzf "${FZF_BASE[@]}" --height 20% --header "Whisper 参数") || true
+
+adv="${adv:-balanced}"
+
+if [[ "$adv" == "custom"* ]]; then
+    use_vad=false
+    use_flash=false
+    use_tdrz=false
+    use_suppress_nst=true
+    use_no_fallback=false
+    use_no_context=false
+    no_speech_threshold=""
+    threads=$CPU_THREADS
+
+    if $VAD_AVAILABLE; then
+        if fftools_confirm "启用 VAD 语音活动检测？[y/N]" no; then
+            use_vad=true
+            printf '提示：VAD 适合连续谈话；音乐、环境声或大量非语言人声建议关闭。\n'
+        fi
+    else
+        printf '⚠ VAD 模型不存在，无法启用 VAD。\n'
+    fi
+
+    if fftools_confirm "启用 Flash Attention？[Y/n]"; then
+        use_flash=true
+    fi
+
+    if ! fftools_confirm "抑制非语音标记以减少幻觉？[Y/n]"; then
+        use_suppress_nst=false
+    fi
+
+    if fftools_confirm "启用说话人分离 (tinydiarize)？[y/N]" no; then
+        use_tdrz=true
+    fi
+
+    read -r -p "线程数 [$CPU_THREADS]: " custom_threads
+    threads="${custom_threads:-$CPU_THREADS}"
+elif [[ "$adv" == "fast-vad"* ]]; then
+    use_vad=$VAD_AVAILABLE
+    use_flash=true
+    use_tdrz=false
+    use_suppress_nst=true
+    use_no_fallback=false
+    use_no_context=false
+    no_speech_threshold=""
+    threads=$CPU_THREADS
+    $VAD_AVAILABLE || printf '⚠ fast-vad 需要 Silero VAD 模型，已退回 balanced。\n'
+elif [[ "$adv" == "robust"* ]]; then
+    use_vad=false
+    use_flash=true
+    use_tdrz=false
+    use_suppress_nst=true
+    use_no_fallback=true
+    use_no_context=true
+    no_speech_threshold="0.50"
+    threads=$CPU_THREADS
+else
+    # balanced：保留原始时间轴，适合大多数视频
+    use_vad=false
+    use_flash=true
+    use_tdrz=false
+    use_suppress_nst=true
+    use_no_fallback=false
+    use_no_context=false
+    no_speech_threshold=""
+    threads=$CPU_THREADS
+fi
+
+# ── 翻译方式选择 ───────────────────────────────────────────
+trans_mode=$(printf '%s\n' \
+    "no          不翻译" \
+    "whisper     Whisper 原生翻译 (仅→English, 最快)" \
+    "ollama      Ollama 大模型翻译 (支持多语言)" \
+| fzf "${FZF_BASE[@]}" --height 25% --header "翻译方式") || true
+
+trans_mode="${trans_mode:-no}"
+trans_mode=$(echo "$trans_mode" | awk '{print $1}')
+
+# ── Ollama 翻译：模型检测 + 目标语言 ──────────────────────
+target_lang=""
+OLLAMA_MODEL=""
+
+if [[ "$trans_mode" == "ollama" ]]; then
+    if ! command -v ollama &>/dev/null; then
+        printf '⚠ 未找到 Ollama，跳过翻译\n'
+        trans_mode="no"
+    else
+        ollama_models=$(ollama list 2>/dev/null | tail -n +2 | awk '{print $1}' || true)
+
+        if [[ -z "$ollama_models" ]]; then
+            printf '⚠ Ollama 无可用模型，跳过翻译\n'
+            trans_mode="no"
+        elif [[ $(printf '%s\n' "$ollama_models" | wc -l) -eq 1 ]]; then
+            OLLAMA_MODEL="$ollama_models"
+        else
+            # 翻译专用模型优先排列
+            OLLAMA_MODEL=$(printf '%s\n' "$ollama_models" |
+                { grep -i translate || true; grep -vi translate || true; } |
+                fzf "${FZF_BASE[@]}" --height 30% --header "Ollama 翻译模型") || exit 0
+        fi
+    fi
+fi
+
+if [[ "$trans_mode" == "ollama" ]]; then
+    tl=$(printf '%s\n' \
+        "zh        中文" \
+        "en        English" \
+        "ja        日本語" \
+        "ko        한국어" \
+        "fr        Français" \
+        "de        Deutsch" \
+        "es        Español" \
+        "custom    自定义" \
+    | fzf "${FZF_BASE[@]}" --height 35% --header "Ollama 翻译目标语言") || exit 0
+
+    case "$tl" in
+        custom*)
+            read -r -p "目标语言: " target_lang
+            target_lang="${target_lang:-en}"
+            ;;
+        *)
+            target_lang=$(echo "$tl" | awk '{print $1}')
+            ;;
+    esac
+fi
+
+# ── 双语模式（仅 Ollama 翻译 + SRT/VTT/LRC 时可选）───────
+bilingual=false
+
+if [[ "$trans_mode" == "ollama" && "$fmt_ext" =~ srt|vtt|lrc ]]; then
+    if fftools_confirm "双语模式（原文+译文）？[y/N]" no; then
+        bilingual=true
+    fi
+fi
+
+# ── 跳过已存在的输出（批量模式，支持中断后续跑）──────────
+skip_existing=false
+
+if [[ "${#FILE_LIST[@]}" -gt 1 ]] && fftools_confirm "跳过已存在的字幕/译文？[Y/n]"; then
+    skip_existing=true
+fi
+
+# ── 批量后处理：每个文件完成后统一封装 MKV ────────────────
+batch_mux=false
+
+if [[ "${#FILE_LIST[@]}" -gt 1 ]] && fftools_confirm "每个文件完成后封装字幕到 MKV？[y/N]" no; then
+    batch_mux=true
+fi
+
+# ═══════════════════════════════════════════════════════════════
+# 构建 Whisper 参数
+# ═══════════════════════════════════════════════════════════════
+build_whisper_args() {
+    local output_file="$1"
+    local input_file="$2"
+
+    whisper_args=(
+        whisper-cli
+        -m "$WHISPER_MODEL"
+        -l "$lang_code"
+        -o"$fmt_ext"
+        -of "$output_file"
+        -t "$threads"
+        -pp
+        -f "$input_file"
+    )
+
+    # VAD + Silero VAD 模型
+    if $use_vad; then
+        if [[ -f "$VAD_MODEL" ]]; then
+            whisper_args+=(
+                --vad
+                --vad-model "$VAD_MODEL"
+                --vad-threshold 0.65
+                --vad-min-speech-duration-ms 600
+                --vad-min-silence-duration-ms 500
+                --vad-speech-pad-ms 100
+            )
+        else
+            printf '⚠ VAD 模型不存在，跳过 VAD\n' >&2
+        fi
+    fi
+
+    # Flash Attention
+    $use_flash && whisper_args+=(--flash-attn)
+
+    # Reduce text hallucinations during silence and non-verbal audio.
+    $use_suppress_nst && whisper_args+=(--suppress-nst)
+
+    $use_no_fallback && whisper_args+=(--no-fallback)
+    $use_no_context && whisper_args+=(--max-context 0)
+    [[ -n "$no_speech_threshold" ]] && whisper_args+=(--no-speech-thold "$no_speech_threshold")
+
+    # Tinydiarize
+    $use_tdrz && whisper_args+=(--tinydiarize)
+
+    # Whisper 原生翻译
+    [[ "$trans_mode" == "whisper" ]] && whisper_args+=(-tr)
+
+    return 0
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 处理单个文件
+# ═══════════════════════════════════════════════════════════════
+process_single() {
+    local media="$1"
+    local dir stem output output_prefix final_output
+
+    # 输出跟随媒体所在目录：批量模式下不同子目录的同名文件不再互相覆盖/错配
+    dir=$(dirname -- "$media")
+    stem=$(basename -- "${media%.*}")
+    output="${dir}/${stem}.${fmt_ext}"
+    output_prefix="${dir}/${stem}"
+    final_output="$output"
+
+    printf '━━━ %s ━━━\n' "$stem"
+
+    local skip_whisper=false
+    if [[ -f "$output" ]] && $skip_existing; then
+        printf '⤼ 字幕已存在，跳过识别: %s\n' "$output"
+        skip_whisper=true
+    fi
+
+    if ! $skip_whisper; then
+        # whisper-cli appends the format extension itself; -of must be a prefix.
+        build_whisper_args "$output_prefix" "$media"
+
+        printf 'Whisper：'
+        printf ' %q' "${whisper_args[@]}"
+        printf '\n'
+
+        # ── 运行 Whisper ──────────────────────────────────────
+        if ! fftools_run "${whisper_args[@]}"; then
+            printf '\n✗ Whisper 处理失败: %s\n' "$media" >&2
+            return 1
+        fi
+
+        if [[ ! -f "$output" ]]; then
+            printf '\n✗ 未找到输出文件: %s\n' "$output" >&2
+            return 1
+        fi
+
+        printf '✓ 字幕已生成: %s\n' "$output"
+    fi
+
+    # ── 预览字幕 ─────────────────────────────────────────────
+    if command -v bat &>/dev/null; then
+        printf '\n── 字幕预览 (前20行) ──\n'
+        bat --paging=never \
+            --style=plain \
+            --line-range=1:20 \
+            -- "$output" 2>/dev/null || true
+
+    elif command -v less &>/dev/null; then
+        printf '\n── 字幕预览 ──\n'
+        head -20 -- "$output" | less -RFX 2>/dev/null || true
+    fi
+
+    # ── Ollama 翻译 ──────────────────────────────────────────
+    if [[ "$trans_mode" == "ollama" && -n "$OLLAMA_MODEL" ]]; then
+        local trans_file="${dir}/${stem}.${target_lang}.${fmt_ext}"
+
+        if [[ -s "$trans_file" ]] && $skip_existing; then
+            printf '⤼ 译文已存在，跳过翻译: %s\n' "$trans_file"
+            final_output="$trans_file"
+        else
+            printf '\n正在用 %s 翻译...\n' "$OLLAMA_MODEL"
+
+            local translate_func
+            case "$fmt_ext" in
+                srt|vtt)
+                    if $bilingual; then
+                        translate_func=translate_subtitle_bilingual
+                    else
+                        translate_func=translate_subtitle
+                    fi
+                    ;;
+                lrc)
+                    if $bilingual; then
+                        translate_func=translate_lrc_bilingual
+                    else
+                        translate_func=translate_lrc
+                    fi
+                    ;;
+                *)
+                    translate_func=translate_plain
+                    ;;
+            esac
+
+            local temporary_translation
+            temporary_translation=$(mktemp "${trans_file}.tmp.XXXXXX")
+            if ! "$translate_func" "$output" "$temporary_translation" "$target_lang"; then
+                rm -f -- "$temporary_translation"
+                printf '\n✗ 翻译失败: %s\n' "$output" >&2
+                return 1
+            fi
+
+            if [[ ! -s "$temporary_translation" ]]; then
+                rm -f -- "$temporary_translation"
+                printf '\n✗ 翻译失败，未生成有效字幕: %s\n' "$trans_file" >&2
+                return 1
+            fi
+
+            mv -f -- "$temporary_translation" "$trans_file"
+
+            printf '\n✓ 翻译完成: %s\n' "$trans_file"
+            final_output="$trans_file"
+        fi
+    fi
+
+    # ── 后处理选项 ───────────────────────────────────────────
+    if [[ "${#FILE_LIST[@]}" -eq 1 ]]; then
+        post_action=$(printf '%s\n' \
+            "no        不做额外处理" \
+            "burn      烧录字幕到视频" \
+            "mux       封装字幕到 MKV (软字幕)" \
+        | fzf "${FZF_BASE[@]}" --height 25% --header "后处理") || true
+
+        post_action="${post_action:-no}"
+        post_action=$(echo "$post_action" | awk '{print $1}')
+
+        case "$post_action" in
+            burn)
+                if [[ -f "${script_dir}/fzf-burn-subs" ]]; then
+                    printf '\n调用烧录字幕工具...\n'
+                    "${script_dir}/fzf-burn-subs" \
+                        "$media" \
+                        "$final_output"
+                else
+                    printf '未找到 fzf-burn-subs\n' >&2
+                fi
+                ;;
+
+            mux)
+                mux_subtitle "$media" "$final_output" "$stem"
+                ;;
+        esac
+    elif $batch_mux; then
+        mux_subtitle "$media" "$final_output" "$stem"
+    fi
+}
+
+# ── 封装字幕到 MKV（软字幕，不重编码）─────────────────────
+mux_subtitle() {
+    local media="$1"
+    local sub_file="$2"
+    local stem="$3"
+    local mux_out
+    mux_out="$(dirname -- "$media")/${stem}.muxed.mkv"
+
+    if [[ ! "$sub_file" =~ \.(srt|vtt|ass|ssa)$ ]]; then
+        printf '⚠ 仅支持 SRT/VTT/ASS 软字幕封装，跳过: %s\n' "$sub_file"
+        return 0
+    fi
+
+    # 显式 -map：新字幕放在第一条字幕轨，否则源视频自带文本字幕时
+    # 自动流选择会挑中旧字幕，刚生成的字幕被静默丢弃
+    if fftools_run ffmpeg \
+        -i "$media" \
+        -i "$sub_file" \
+        -map 0:v -map '0:a?' -map 1:s:0 -map '0:s?' \
+        -c:v copy \
+        -c:a copy \
+        -c:s copy \
+        -metadata:s:s:0 language="${target_lang:-und}" \
+        -y "$mux_out"; then
+        printf '\n✓ 封装完成: %s\n' "$mux_out"
+    else
+        printf '\n✗ 封装失败: %s (详见上方日志)\n' "$mux_out" >&2
+        return 1
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 翻译函数
+# ═══════════════════════════════════════════════════════════════
+
+# ── 语言代码 → 语言名称 ─────────────────────────────────────
+lang_name() {
+    case "$1" in
+        zh) echo "简体中文" ;;
+        en) echo "English" ;;
+        ja) echo "日本語" ;;
+        ko) echo "한국어" ;;
+        fr) echo "Français" ;;
+        de) echo "Deutsch" ;;
+        es) echo "Español" ;;
+        ru) echo "Русский" ;;
+        pt) echo "Português" ;;
+        ar) echo "العربية" ;;
+        it) echo "Italiano" ;;
+        th) echo "ไทย" ;;
+        vi) echo "Tiếng Việt" ;;
+        *)  echo "$1" ;;
+    esac
+}
+
+# ── 调用 Ollama 翻译 ────────────────────────────────────────
+call_ollama_translate() {
+    local text="$1"
+    local lang="$2"
+    local lname
+    local translated
+
+    lname=$(lang_name "$lang")
+
+    translated=$(ollama run "$OLLAMA_MODEL" \
+        "Translate the following subtitle text to ${lname}. Output ONLY the translation, nothing else. Preserve original line breaks.
+
+$text" </dev/null) || return 1
+
+    [[ -n "$translated" ]] || return 1
+    translated=$(printf '%s' "$translated" | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//')
+    printf '%s\n' "$translated"
+}
+
+# ── SRT/VTT 翻译：保留时间轴 ──────────────────────────────
+translate_subtitle() {
+    local input="$1"
+    local output="$2"
+    local lang="$3"
+
+    local timestamp=""
+    local segment_text=""
+    local line total label
+    local seq_num=0
+
+    total=$(awk '/^[0-9][0-9]:[0-9][0-9]:[0-9][,.]/{count++} END{print count + 0}' "$input")
+    label=$(basename -- "$input")
+
+    > "$output"
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ -z "$line" ]]; then
+            if [[ -n "$segment_text" ]]; then
+                local translated
+
+                translated=$(call_ollama_translate "$segment_text" "$lang") || return 1
+                seq_num=$((seq_num + 1))
+
+                if [[ "$input" == *.vtt ]]; then
+                    printf '%s\n%s\n\n' \
+                        "$timestamp" \
+                        "$translated" >> "$output"
+                else
+                    printf '%d\n%s\n%s\n\n' \
+                        "$seq_num" \
+                        "$timestamp" \
+                        "$translated" >> "$output"
+                fi
+                fftools_progress "$seq_num" "$total" "$label"
+
+                segment_text=""
+                timestamp=""
+            fi
+
+            continue
+        fi
+
+        [[ "$line" == "WEBVTT"* ]] && {
+            echo "$line" >> "$output"
+            continue
+        }
+
+        [[ "$line" =~ ^[0-9]{2}:[0-9]{2}:[0-9]{2}[,.] ]] && {
+            timestamp="$line"
+            continue
+        }
+
+        [[ "$line" =~ ^[0-9]+$ ]] &&
+            [[ -z "$timestamp" ]] && continue
+
+        [[ "$line" =~ ^NOTE ]] && {
+            echo "$line" >> "$output"
+            continue
+        }
+
+        segment_text="${segment_text:+$segment_text
+}$line"
+
+    done < "$input"
+
+    if [[ -n "$segment_text" ]]; then
+        local translated
+
+        translated=$(call_ollama_translate "$segment_text" "$lang") || return 1
+        seq_num=$((seq_num + 1))
+
+        if [[ "$input" == *.vtt ]]; then
+            printf '%s\n%s\n\n' \
+                "$timestamp" \
+                "$translated" >> "$output"
+        else
+            printf '%d\n%s\n%s\n\n' \
+                "$seq_num" \
+                "$timestamp" \
+                "$translated" >> "$output"
+        fi
+        fftools_progress "$seq_num" "$total" "$label"
+    fi
+}
+
+# ── SRT/VTT 双语翻译 ──────────────────────────────────────
+translate_subtitle_bilingual() {
+    local input="$1"
+    local output="$2"
+    local lang="$3"
+
+    local timestamp=""
+    local segment_text=""
+    local seq_num=0
+    local line total label
+
+    total=$(awk '/^[0-9][0-9]:[0-9][0-9]:[0-9][,.]/{count++} END{print count + 0}' "$input")
+    label=$(basename -- "$input")
+
+    > "$output"
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ -z "$line" ]]; then
+            if [[ -n "$segment_text" ]]; then
+                local translated
+
+                translated=$(call_ollama_translate "$segment_text" "$lang") || return 1
+                seq_num=$((seq_num + 1))
+
+                printf '%d\n%s\n%s\n%s\n\n' \
+                    "$seq_num" \
+                    "$timestamp" \
+                    "$segment_text" \
+                    "$translated" >> "$output"
+                fftools_progress "$seq_num" "$total" "$label"
+
+                segment_text=""
+                timestamp=""
+            fi
+
+            continue
+        fi
+
+        [[ "$line" == "WEBVTT"* ]] && {
+            echo "$line" >> "$output"
+            continue
+        }
+
+        [[ "$line" =~ ^[0-9]{2}:[0-9]{2}:[0-9]{2}[,.] ]] && {
+            timestamp="$line"
+            continue
+        }
+
+        [[ "$line" =~ ^[0-9]+$ ]] &&
+            [[ -z "$timestamp" ]] && continue
+
+        [[ "$line" =~ ^NOTE ]] && {
+            echo "$line" >> "$output"
+            continue
+        }
+
+        segment_text="${segment_text:+$segment_text
+}$line"
+
+    done < "$input"
+
+    if [[ -n "$segment_text" ]]; then
+        local translated
+
+        translated=$(call_ollama_translate "$segment_text" "$lang") || return 1
+        seq_num=$((seq_num + 1))
+
+        if [[ "$input" == *.vtt ]]; then
+            printf '%s\n%s\n%s\n\n' \
+                "$timestamp" \
+                "$segment_text" \
+                "$translated" >> "$output"
+        else
+            printf '%d\n%s\n%s\n%s\n\n' \
+                "$seq_num" \
+                "$timestamp" \
+                "$segment_text" \
+                "$translated" >> "$output"
+        fi
+        fftools_progress "$seq_num" "$total" "$label"
+    fi
+}
+
+# ── LRC 翻译：保留时间标签 ────────────────────────────────
+translate_lrc() {
+    local input="$1"
+    local output="$2"
+    local lang="$3"
+    local line
+    local index=0 total label
+
+    total=$(awk '/^\[[0-9][0-9]:[0-9][0-9]\.[0-9][0-9][0-9]?\].+/{count++} END{print count + 0}' "$input")
+    label=$(basename -- "$input")
+
+    > "$output"
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^(\[[0-9][0-9]:[0-9][0-9]\.[0-9]{2,3}\])(.*)$ ]]; then
+            local tag="${BASH_REMATCH[1]}"
+            local text="${BASH_REMATCH[2]}"
+
+            if [[ -n "$text" ]]; then
+                local translated
+
+                translated=$(call_ollama_translate "$text" "$lang") || return 1
+
+                printf '%s%s\n' \
+                    "$tag" \
+                    "$translated" >> "$output"
+                ((++index))
+                fftools_progress "$index" "$total" "$label"
+            else
+                echo "$line" >> "$output"
+            fi
+        else
+            echo "$line" >> "$output"
+        fi
+    done < "$input"
+}
+
+# ── LRC 双语翻译 ─────────────────────────────────────────
+translate_lrc_bilingual() {
+    local input="$1"
+    local output="$2"
+    local lang="$3"
+    local line
+    local index=0 total label
+
+    total=$(awk '/^\[[0-9][0-9]:[0-9][0-9]\.[0-9][0-9][0-9]?\].+/{count++} END{print count + 0}' "$input")
+    label=$(basename -- "$input")
+
+    > "$output"
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^(\[[0-9][0-9]:[0-9][0-9]\.[0-9]{2,3}\])(.*)$ ]]; then
+            local tag="${BASH_REMATCH[1]}"
+            local text="${BASH_REMATCH[2]}"
+
+            if [[ -n "$text" ]]; then
+                local translated
+
+                translated=$(call_ollama_translate "$text" "$lang") || return 1
+
+                printf '%s%s / %s\n' \
+                    "$tag" \
+                    "$text" \
+                    "$translated" >> "$output"
+                ((++index))
+                fftools_progress "$index" "$total" "$label"
+            else
+                echo "$line" >> "$output"
+            fi
+        else
+            echo "$line" >> "$output"
+        fi
+    done < "$input"
+}
+
+# ── 纯文本翻译：按块分割，避免超出模型上下文 ─────────────
+translate_plain() {
+    local input="$1"
+    local output="$2"
+    local lang="$3"
+
+    local chunk_size=2000
+    local buf="" line translated
+    local size=0 index=0 total label
+
+    total=$(awk -v sz="$chunk_size" \
+        '{c += length($0) + 1; if (c >= sz) {n++; c = 0}} END {if (c > 0) n++; print n + 0}' \
+        "$input")
+    label=$(basename -- "$input")
+
+    > "$output"
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        buf+="$line"$'\n'
+        size=$((size + ${#line} + 1))
+
+        if (( size >= chunk_size )); then
+            translated=$(call_ollama_translate "$buf" "$lang") || return 1
+            printf '%s\n' "$translated" >> "$output"
+            ((++index))
+            fftools_progress "$index" "$total" "$label"
+            buf=""
+            size=0
+        fi
+    done < "$input"
+
+    if [[ -n "$buf" ]]; then
+        translated=$(call_ollama_translate "$buf" "$lang") || return 1
+        printf '%s\n' "$translated" >> "$output"
+        ((++index))
+        fftools_progress "$index" "$total" "$label"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 批量处理（必须位于翻译函数定义之后）
+# ═══════════════════════════════════════════════════════════════
+success_count=0
+fail_count=0
+total=${#FILE_LIST[@]}
+
+for (( i = 0; i < total; i++ )); do
+    current="${FILE_LIST[$i]}"
+
+    printf '\n╔══════════════════════════════════════════════════════╗\n'
+    printf '║  [%d/%d] %s\n' \
+        "$((i + 1))" \
+        "$total" \
+        "$(basename -- "$current")"
+    printf '╚══════════════════════════════════════════════════════╝\n'
+
+    if process_single "$current"; then
+        ((++success_count))
+    else
+        ((++fail_count))
+    fi
+done
+
+printf '\n════════════════════════════════════════════════════\n'
+printf '处理完成: %d/%d 成功' "$success_count" "$total"
+(( fail_count > 0 )) && printf ', %d 失败' "$fail_count"
+printf '\n'

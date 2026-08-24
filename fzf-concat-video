@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# fzf-concat-video:summary=Concatenate multiple videos into one via fzf.
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/fzf-fftools-lib"
+
+require_tools ffmpeg ffprobe || exit 1
+
+if [[ $# -ge 2 ]]; then
+    videos=("$@")
+else
+    require_tools fzf fd || exit 1
+    mapfile -t videos < <(pick_videos)
+    mapfile -t videos < <(printf '%s\n' "${videos[@]}" | sort -V)
+fi
+(( ${#videos[@]} < 2 )) && { echo "至少需要2个视频"; exit 1; }
+
+# 检测视频参数一致性
+if check_video_consistency "${videos[@]}" 2>/dev/null; then
+    consistent=true
+else
+    consistent=false
+    printf '⚠️  所选视频的编码参数（编码器/分辨率/帧率）不一致。\n'
+    mode=$(printf '重编码拼接 (兼容性最好, 较慢)\n仍然尝试无损拷贝 (可能花屏/音画不同步)\n' \
+        | fzf "${FZF_BASE[@]}" --height 30% --header '拼接模式') || exit 0
+    [[ "$mode" == 仍然* ]] && consistent=true
+    reencode=true
+    [[ "$mode" == 仍然* ]] && reencode=false
+fi
+
+listfile=$(mktemp /tmp/ffconcat_XXXXXX.txt)
+trap 'rm -f -- "$listfile"' EXIT
+
+concat_escape_path() {
+    local path="$1"
+    path=${path//\'/\'\\\'\'}
+    printf "'%s'" "$path"
+}
+
+for v in "${videos[@]}"; do
+    printf 'file %s\n' "$(concat_escape_path "$(realpath -- "$v")")" >> "$listfile"
+done
+
+printf '\n拼接顺序:\n'
+cat -n "$listfile"
+printf '\n'
+
+output="concat_output.mp4"
+read -r -p "输出 [$output]: " custom
+output="${custom:-$output}"
+
+if [[ "${consistent:-false}" == true && "${reencode:-false}" != true ]]; then
+    fftools_run ffmpeg -f concat -safe 0 -i "$listfile" -c copy -y "$output"
+else
+    # 先用 concat demuxer 合并再统一重编码
+    printf '正在重编码拼接...\n'
+    fftools_run ffmpeg -f concat -safe 0 -i "$listfile" \
+        -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p \
+        -c:a aac -b:a 192k -y "$output"
+fi

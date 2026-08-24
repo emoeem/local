@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Generic fzf preview entrypoint. Media, directories and text share one renderer.
+set -u
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+exec "$script_dir/fzf-preview-video" "${1:-}"

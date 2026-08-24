@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# fzf-speed-video:summary=Change video playback speed via fzf.
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/fzf-fftools-lib"
+
+require_tools ffmpeg ffprobe || exit 1
+
+if [[ $# -gt 0 ]]; then
+    video="$1"
+else
+    require_tools fzf fd || exit 1
+    video=$(pick_video) || exit 0
+    [[ -z "$video" ]] && exit 0
+fi
+
+speed=$(printf '0.5x (慢放一半)\n0.75x\n1.25x\n1.5x\n2.0x (双倍速)\n3.0x' \
+    | fzf "${FZF_BASE[@]}" --height 30% --header '速度倍率') || exit 0
+[[ -z "$speed" ]] && exit 0
+factor=$(echo "$speed" | grep -oP '[\d.]+')
+
+output="${video%.*}_x${factor}.mp4"
+read -r -p "输出 [$output]: " custom || true
+output="${custom:-$output}"
+if [[ "$(realpath -m -- "$output")" == "$(realpath -m -- "$video")" ]]; then
+    output="${video%.*}_x${factor}.mp4"
+    printf '⚠️  输出与输入相同，已改为: %s\n' "$output"
+fi
+
+setpts_val=$(awk "BEGIN {printf \"%.4f\", 1/$factor}")
+
+if ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 -- "$video" 2>/dev/null | grep -q .; then
+    atempo_chain=$(build_atempo_chain "$factor")
+    fftools_run ffmpeg -i "$video" \
+        -filter_complex "[0:v]setpts=${setpts_val}*PTS[v];[0:a]${atempo_chain}[a]" \
+        -map "[v]" -map "[a]" -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a aac -y "$output"
+else
+    printf 'ℹ️ 无音轨，仅调整视频速度\n'
+    fftools_run ffmpeg -i "$video" \
+        -vf "setpts=${setpts_val}*PTS" -an \
+        -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -y "$output"
+fi

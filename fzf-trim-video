@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# fzf-trim-video:summary=Trim/cut video segment (lossless or re-encoded) via fzf.
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/fzf-fftools-lib"
+
+require_tools ffmpeg ffprobe || exit 1
+
+if [[ $# -gt 0 ]]; then
+    video="$1"
+else
+    require_tools fzf fd || exit 1
+    video=$(pick_video) || exit 0
+    [[ -z "$video" ]] && exit 0
+fi
+
+# 显示视频时长供参考
+duration_info=$(ffprobe -v error -show_entries format=duration -of csv=p=0 -- "$video" 2>/dev/null || echo "未知")
+printf '视频时长: %s\n' "$duration_info"
+
+printf '格式: HH:MM:SS 或 秒数\n'
+read -r -p "开始时间: " ss
+[[ -z "$ss" ]] && exit 0
+read -r -p "持续时长 (留空=到结尾): " t
+
+# 选择切割模式
+mode=$(printf '快速 (无损拷贝, 关键帧对齐, 极快)\n精确 (重编码, 精确到帧, 较慢)' \
+    | fzf "${FZF_BASE[@]}" --height 30% --header '切割模式 (快速模式可能不精确)') || exit 0
+reencode=false
+[[ "$mode" == 精* ]] && reencode=true
+
+output="${video%.*}_clip.${video##*.}"
+read -r -p "输出 [$output]: " custom || true
+output="${custom:-$output}"
+if [[ "$(realpath -m -- "$output")" == "$(realpath -m -- "$video")" ]]; then
+    output="${video%.*}_clip.${video##*.}"
+    printf '⚠️  输出与输入相同，已改为: %s\n' "$output"
+fi
+
+if [[ "$reencode" == true ]]; then
+    args=(-ss "$ss" -i "$video")
+    [[ -n "$t" ]] && args+=(-t "$t")
+    args+=(-c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a aac -y "$output")
+    fftools_run ffmpeg "${args[@]}"
+else
+    printf '⚠️  无损拷贝模式：切割点会对齐到最近的关键帧，实际开始时间可能有偏差。\n'
+    args=(-ss "$ss" -i "$video")
+    [[ -n "$t" ]] && args+=(-t "$t")
+    args+=(-c copy -avoid_negative_ts make_zero -y "$output")
+    fftools_run ffmpeg "${args[@]}"
+fi

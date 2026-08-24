@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# fzf-burn-subs:summary=Burn/hardcode subtitles into video via fzf.
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/fzf-fftools-lib"
+
+if [[ $# -ge 2 ]]; then
+    video="$1"; subs="$2"
+elif [[ $# -eq 1 ]]; then
+    # 只传了视频：让用户补选字幕，而不是丢弃参数
+    require_tools fzf fd || exit 1
+    video="$1"
+    subs=$(pick_subtitle) || exit 0
+    [[ -z "$subs" ]] && exit 0
+else
+    require_tools fzf fd || exit 1
+    video=$(pick_video) || exit 0
+    [[ -z "$video" ]] && exit 0
+    subs=$(pick_subtitle) || exit 0
+    [[ -z "$subs" ]] && exit 0
+fi
+
+output="${video%.*}_subbed.mp4"
+read -r -p "输出 [$output]: " custom || true
+output="${custom:-$output}"
+if [[ "$(realpath -m -- "$output")" == "$(realpath -m -- "$video")" ]]; then
+    output="${video%.*}_subbed.mp4"
+    printf '⚠️  输出与输入相同，已改为: %s\n' "$output"
+fi
+
+font_file=$(fftools_pick_font || true)
+font_size=$(fftools_pick_font_size 18 || true)
+font_size=${font_size:-18}
+font_name=$(fftools_font_family "$font_file" 2>/dev/null || true)
+fonts_dir=""
+[[ -n "$font_file" ]] && fonts_dir=$(dirname -- "$font_file")
+fftools_font_summary "$(sed -E '/^[0-9]+$|^[[:space:]]*$|-->/d' "$subs" 2>/dev/null | tr -d '\n')" \
+    "$font_file" "$font_size"
+subtitle_filter=$(subtitle_filter "$subs" "$font_size" "$font_name" "$fonts_dir")
+fftools_run ffmpeg -i "$video" -vf "$subtitle_filter" \
+    -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a copy -y "$output"

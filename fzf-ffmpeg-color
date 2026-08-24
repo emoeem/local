@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# fzf-ffmpeg-color: 色彩管理 — HDR↔SDR、色域转换
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/fzf-fftools-lib"
+input="${1:-}"
+if [[ -z "$input" ]]; then
+    input=$(pick_video) || exit
+fi
+base="${input%.*}"
+modes=("HDR10→SDR  HDR 压到标准色域"
+    "SDR→HDR10    SDR 升到 HDR"
+    "BT.709→2020  标准色域转广色域"
+    "注入元数据    手动指定 mastering/cll")
+mode=$(printf '%s\n' "${modes[@]}" | fzf "${FZF_BASE[@]}" --header '色彩转换' \
+    --preview 'echo "{2}"' --preview-window 'bottom:1' | awk '{print $1}') || exit
+
+case "$mode" in
+    HDR10→SDR)
+        cmd=(ffmpeg -i "$input" -vf 'zscale=transfer=linear,tonemap=hable,zscale=transfer=bt709:primaries=bt709:matrix=bt709' -c:v libx265 -crf 22 -pix_fmt yuv420p10le -c:a copy "${base}_SDR.mp4") ;;
+    SDR→HDR10)
+        echo -n "峰值 nit [1000]: "; read -r peak; [[ -z "$peak" ]] && peak=1000
+        cmd=(ffmpeg -i "$input" -vf 'zscale=transferin=bt709:matrixin=bt709:primariesin=bt709:transfer=linear,zscale=transfer=smpte2084:matrix=bt2020nc:primaries=bt2020:range=tv,format=yuv420p10le' -c:v libx265 -crf 20 -pix_fmt yuv420p10le -c:a copy -x265-params "hdr10=1:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(${peak}0000,50):max-cll=$peak,400" "${base}_HDR10.mp4") ;;
+    BT.709→2020)
+        cmd=(ffmpeg -i "$input" -vf 'zscale=primaries=bt2020:matrix=bt2020nc:transfer=bt709,format=yuv420p10le' -c:v libx265 -crf 20 -pix_fmt yuv420p10le -c:a copy "${base}_bt2020.mp4") ;;
+    注入元数据)
+        echo -n "master-display [G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50)]: "; read -r md
+        [[ -z "$md" ]] && md="G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50)"
+        echo -n "max-cll [1000,400]: "; read -r mcll; [[ -z "$mcll" ]] && mcll="1000,400"
+        cmd=(ffmpeg -i "$input" -c:v copy -bsf:v "hevc_metadata=master_display=$md:max_cll=$mcll" -c:a copy "${base}_hdr_meta.mp4") ;;
+esac
+
+confirm_run_cmd "${cmd[@]}"

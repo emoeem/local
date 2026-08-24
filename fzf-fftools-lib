@@ -1,0 +1,506 @@
+#!/usr/bin/env bash
+# fzf-fftools shared functions and picker definitions.
+
+FZF_FFTOOLS_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+PVID="$FZF_FFTOOLS_DIR/fzf-preview-video"
+[[ -x "$PVID" ]] || PVID="$(command -v fzf-preview-video 2>/dev/null || true)"
+FFTOOLS_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/fzf-fftools"
+FFTOOLS_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/fzf-media-preview"
+FFTOOLS_FONT_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/fzf-fftools/fonts.tsv"
+
+FZF_BASE=(
+    --height 100%
+    --preview-label-pos bottom
+    --preview-window 'right:60%:nowrap:border-left'
+    --bind 'ctrl-p:toggle-preview'
+    --bind 'ctrl-w:toggle-preview-wrap'
+    --bind 'ctrl-d:preview-half-page-down,ctrl-u:preview-half-page-up'
+    --bind 'ctrl-up:preview-up,ctrl-down:preview-down'
+    --color 'pointer:green,marker:green,header:cyan'
+)
+
+FZF_MULTI_BASE=(
+    --multi
+    --bind 'ctrl-a:select-all,ctrl-x:deselect-all'
+)
+
+open_yazi_media() {
+    require_tools yazi || return 1
+    yazi "${1:-.}"
+}
+
+ffmpeg() {
+    command ffmpeg "$@"
+}
+
+require_tools() {
+    local missing=() tool
+    for tool in "$@"; do
+        command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+    done
+    if (( ${#missing[@]} > 0 )); then
+        printf '缺少命令: %s\n' "${missing[*]}" >&2
+        return 1
+    fi
+}
+
+media_candidates() {
+    local regex="$1"
+    fd --type f --ignore-case "$regex" --hidden --follow \
+        --exclude .git --exclude node_modules --exclude target --exclude .cache \
+        --exclude batch_out . 2>/dev/null
+}
+
+pick_with_preview() {
+    local header="$1"
+    fzf "${FZF_BASE[@]}" --header "$header" --preview "$PVID {}"
+}
+
+pick_multi_with_preview() {
+    local header="$1"
+    fzf "${FZF_BASE[@]}" "${FZF_MULTI_BASE[@]}" --header "$header" \
+        --preview "$PVID {}"
+}
+
+pick_video() {
+    media_candidates '\.(mp4|mkv|mov|avi|webm|ts|m4v|flv|mpeg|mpg|wmv|3gp)$' |
+        pick_with_preview '选择视频 · Ctrl-P 切换预览'
+}
+
+pick_videos() {
+    media_candidates '\.(mp4|mkv|mov|avi|webm|ts|m4v|flv|mpeg|mpg|wmv|3gp)$' |
+        pick_multi_with_preview '选择视频 · Tab 多选 · Ctrl-A 全选'
+}
+
+pick_image() {
+    media_candidates '\.(jpg|jpeg|png|webp|bmp|gif|tiff|tif|avif|heic|heif|jxl|apng)$' |
+        pick_with_preview '选择图片 · Ctrl-P 切换预览'
+}
+
+pick_visual() {
+    media_candidates '\.(mp4|mkv|mov|avi|webm|ts|m4v|flv|mpeg|mpg|wmv|3gp|jpg|jpeg|png|webp|bmp|gif|tiff|tif|avif|heic|heif|jxl|apng)$' |
+        pick_with_preview '选择图片或视频 · Ctrl-P 切换预览'
+}
+
+pick_audio() {
+    media_candidates '\.(mp3|flac|wav|aac|m4a|opus|ogg|wma|ac3|aiff|ape)$' |
+        pick_with_preview '选择音频 · 预览封面或波形'
+}
+
+pick_media() {
+    media_candidates '\.(mp4|mkv|mov|avi|webm|ts|m4v|flv|mpeg|mpg|wmv|3gp|mp3|flac|wav|aac|m4a|opus|ogg|wma|ac3|aiff|ape|jpg|jpeg|png|webp|bmp|gif|tiff|tif|avif|heic|heif|jxl|apng)$' |
+        pick_with_preview '浏览媒体 · 图片/视频帧/音频封面'
+}
+
+pick_files() {
+    media_candidates '\.(mp4|mkv|mov|avi|webm|ts|m4v|flv|mpeg|mpg|wmv|3gp|jpg|jpeg|png|webp|bmp|gif|tiff|tif|avif)$' |
+        pick_multi_with_preview '选择文件 · Tab 多选 · Ctrl-A 全选'
+}
+
+fftools_log() {
+    mkdir -p -- "$FFTOOLS_STATE_DIR"
+    printf '[%(%F %T)T] %s\n' -1 "$*" >> "$FFTOOLS_STATE_DIR/tasks.log"
+}
+
+fftools_confirm() {
+    local prompt="${1:-执行上述任务？[Y/n]}"
+    local default="${2:-yes}"
+    local choice
+
+    printf '\n%s ' "$prompt"
+    read -r choice
+    if [[ -z "$choice" ]]; then
+        [[ "$default" == "yes" ]]
+    else
+        [[ "$choice" != [nN]* ]]
+    fi
+}
+
+fftools_progress() {
+    local current="$1" total="$2" label="${3:-}"
+    local width=30 percent filled empty
+    local complete_bar remaining_bar
+
+    (( total > 0 )) || return 0
+    percent=$((current * 100 / total))
+    (( percent > 100 )) && percent=100
+    filled=$((percent * width / 100))
+    empty=$((width - filled))
+    printf -v complete_bar '%*s' "$filled" ''
+    printf -v remaining_bar '%*s' "$empty" ''
+    complete_bar=${complete_bar// /#}
+    remaining_bar=${remaining_bar// /-}
+    printf '\r翻译 [%s%s] %3d%%  %d/%d  %s' \
+        "$complete_bar" "$remaining_bar" "$percent" "$current" "$total" "$label"
+    (( current >= total )) && printf '\n'
+    return 0
+}
+
+fftools_run() {
+    local log_path status
+    mkdir -p -- "$FFTOOLS_STATE_DIR/logs"
+    log_path="$FFTOOLS_STATE_DIR/logs/$(date +%Y%m%d-%H%M%S)-$$.log"
+    printf '\n命令：'
+    printf ' %q' "$@"
+    printf '\n日志：%s\n\n' "$log_path"
+    fftools_log "start: $(printf '%q ' "$@")"
+    command "$@" 2>&1 | tee "$log_path"
+    status=${PIPESTATUS[0]}
+    fftools_log "finished($status): $log_path"
+    return "$status"
+}
+
+fftools_output_path() {
+    local input="$1" suffix="$2" extension="$3" output_dir="$4" force="$5"
+    local stem candidate index=1
+    stem=$(basename -- "${input%.*}")
+    mkdir -p -- "$output_dir"
+    candidate="$output_dir/${stem}${suffix}.${extension}"
+    if [[ "$force" == true || ! -e "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return
+    fi
+    while [[ -e "$output_dir/${stem}${suffix}-${index}.${extension}" ]]; do
+        ((index++))
+    done
+    printf '%s\n' "$output_dir/${stem}${suffix}-${index}.${extension}"
+}
+
+fftools_doctor() {
+    local tool encoder
+    for tool in ffmpeg ffprobe fzf fd chafa; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            printf '✓ %-8s %s\n' "$tool" "$(command -v "$tool")"
+        else
+            printf '✗ %-8s 未安装\n' "$tool"
+        fi
+    done
+    printf '\n编码器：\n'
+    for encoder in h264_nvenc hevc_nvenc av1_nvenc libx264 libx265 libsvtav1; do
+        if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q " $encoder"; then
+            printf '✓ %s\n' "$encoder"
+        else
+            printf '· %s 不可用\n' "$encoder"
+        fi
+    done
+    ffmpeg -hide_banner -filters 2>/dev/null | grep -q ' subtitles ' && printf '✓ libass 字幕滤镜\n' || printf '· libass 字幕滤镜不可用\n'
+}
+
+fftools_analyze() {
+    ffprobe -v error -show_format -show_streams -of json -- "$1"
+}
+
+fftools_cache() {
+    case "${1:-status}" in
+        status) du -sh -- "$FFTOOLS_CACHE_DIR" 2>/dev/null || printf '缓存为空。\n' ;;
+        clear) rm -rf -- "$FFTOOLS_CACHE_DIR"; printf '预览缓存已清理。\n' ;;
+        prune) find "$FFTOOLS_CACHE_DIR" -type f -mtime +30 -delete 2>/dev/null; printf '已清理 30 天前的预览缓存。\n' ;;
+        *) printf '用法: cache [status|clear|prune]\n' >&2; return 2 ;;
+    esac
+}
+
+confirm_run_cmd() {
+    printf '命令：'
+    printf ' %q' "$@"
+    printf '\n'
+    fftools_confirm || return 0
+    fftools_run "$@"
+}
+
+VENC_LIST=(
+    "copy             复制视频流，不重新编码"  "-vn              禁用视频流"
+    "─── AV1 ───"  "libsvtav1        SVT-AV1 软件  | -preset 0~13(6)  | -crf 0~63(23)"
+    "libaom-av1       AOM AV1 软件，极慢 | -cpu-used 0~8(5)  | -crf 0~63(30)"
+    "av1_nvenc        NVIDIA NVENC 硬件    | -preset p7~p1(p7) | -cq 0~255(36)"
+    "─── H.265/HEVC ───"
+    "libx265          x265 软件，最主流    | -preset veryslow~ultrafast(slow) | -crf 0~51(23)"
+    "hevc_nvenc       NVIDIA NVENC 硬件    | -preset p7~p1(p7) | -cq 0~51(26)"
+    "─── H.264/AVC ───"
+    "libx264          x264 软件，兼容最好   | -preset veryslow~ultrafast(slower) | -crf 0~51(23)"
+    "h264_nvenc       NVIDIA NVENC 硬件    | -preset p7~p1(p7) | -cq 0~51(23)"
+    "─── 其他 ───"
+    "libvpx-vp9       VP9 (Google) | -crf 0~63"  "prores_ks        ProRes 剪辑格式"
+)
+AENC_LIST=(
+    "copy 复制音频流" "-an 禁用音频流" "aac AAC | -b:a 128k~320k"
+    "opus Opus | -b:a 96k~192k" "mp3 MP3 | -b:a 128k~320k" "flac FLAC 无损"
+    "pcm_s16le WAV 无损" "libvorbis Vorbis" "ac3 AC-3"
+)
+PSMAP=(
+    "libsvtav1:-preset:0~13:6" "libaom-av1:-cpu-used:0~8:5"
+    "av1_nvenc:-preset:p7~p1:p7" "libx265:-preset:veryslow~ultrafast:slow"
+    "hevc_nvenc:-preset:p7~p1:p7" "libx264:-preset:veryslow~ultrafast:slower"
+)
+QMAP=(
+    "libsvtav1:-crf:0~63:23" "libaom-av1:-crf:0~63:30" "av1_nvenc:-cq:0~255:36"
+    "libx265:-crf:0~51:23" "hevc_nvenc:-cq:0~51:26" "libx264:-crf:0~51:23"
+)
+
+get_preset() {
+    local encoder="$1" item flag range default value
+    for item in "${PSMAP[@]}"; do
+        if [[ "$item" == "$encoder:"* ]]; then
+            IFS=: read -r _ flag range default <<< "$item"
+            value=$(printf '%s\n' "$range" | tr '~' '\n' | fzf --height 25% --header "$flag (默认 $default)") || value=""
+            printf '%s\n' "${value:-$default}"
+            return 0
+        fi
+    done
+    return 0
+}
+
+get_quality() {
+    local encoder="$1" item flag range default value
+    for item in "${QMAP[@]}"; do
+        if [[ "$item" == "$encoder:"* ]]; then
+            IFS=: read -r _ flag range default <<< "$item"
+            printf '%s [%s] 默认 %s: ' "$flag" "$range" "$default" >&2
+            read -r value || value=""
+            printf '%s\n' "${value:-$default}"
+            return 0
+        fi
+    done
+    return 0
+}
+
+pix_fmt() {
+    case "$1" in
+        *nvenc) echo "-pix_fmt p010le" ;;
+        libx265|libx264) echo "-pix_fmt yuv420p10le" ;;
+    esac
+}
+
+# ── 转义 FFmpeg subtitles 滤镜路径中的特殊字符 ──────────
+escape_subtitle_path() {
+    local path="$1"
+    path="${path//\\/\\\\}"    # backslash
+    path="${path//:/\\:}"       # colon
+    # ffmpeg 滤镜解析里单引号内的 \ 是字面字符，\' 会提前闭合引号；
+    # 必须用 shell 风格的 '\'' (闭合引号→转义引号→重开引号)
+    path="${path//\'/\'\\\'\'}" # single quote
+    path="${path//\[/\\[}"      # open bracket
+    path="${path//\]/\\]}"      # close bracket
+    printf '%s' "$path"
+}
+
+subtitle_filter() {
+    local subtitle_path="$1"
+    local font_size="${2:-${FZF_SUBTITLE_FONT_SIZE:-18}}"
+    local font_name="${3:-${FZF_SUBTITLE_FONT_NAME:-}}"
+    local fonts_dir="${4:-${FZF_SUBTITLE_FONTS_DIR:-}}"
+    local filter style
+    [[ "$font_size" =~ ^[1-9][0-9]{0,2}$ ]] || font_size=18
+    style="FontSize=$font_size"
+    font_name=${font_name//,/}
+    [[ -n "$font_name" ]] && style+=",FontName=${font_name//\'/}"
+    filter="subtitles='$(escape_subtitle_path "$subtitle_path")'"
+    [[ -n "$fonts_dir" ]] && filter+=":fontsdir='$(escape_subtitle_path "$fonts_dir")'"
+    printf "%s:force_style='%s'" "$filter" "$style"
+}
+
+# ── 字体发现、推荐与烧录工作流 ─────────────────────────
+# 字体缓存字段：评分、推荐标签、家族、样式、格式、字重、等宽、中文、ASCII、路径
+fftools_scan_fonts() {
+    require_tools fc-list awk sort || return 1
+    local output="${1:-$FFTOOLS_FONT_CACHE}" temporary
+    mkdir -p -- "$(dirname -- "$output")"
+    temporary=$(mktemp "${output}.XXXXXX") || return 1
+    fc-list --format '%{family[0]}\t%{style[0]}\t%{file}\t%{weight}\t%{spacing}\t%{lang}\n' 2>/dev/null |
+        awk -F '\t' 'BEGIN { OFS="\t" }
+            !seen[$3]++ {
+                family=$1; style=$2; file=$3; weight=$4; spacing=$5; langs=$6
+                extension=file; sub(/^.*\./, "", extension); extension=toupper(extension)
+                chinese=(langs ~ /(^|\|)zh([_-]|\||$)/ ? "是" : "否")
+                ascii=(langs ~ /(^|\|)en([_-]|\||$)/ ? "是" : "否")
+                mono=(spacing == 100 || tolower(family) ~ /(mono|code|console|terminal)/ ? "是" : "否")
+                score=10
+                if (chinese == "是") score+=30
+                if (ascii == "是") score+=20
+                if (mono == "是") score+=10
+                if (extension ~ /^(TTF|OTF|TTC|OTC)$/) score+=10
+                if (tolower(family) ~ /(noto|source han|思源|misans|lxgw|文楷|maple|sarasa|更纱)/) score+=15
+                if (tolower(family) ~ /(symbol|emoji|dingbat|icon)/) score-=25
+                stars=(score >= 75 ? "★★★ 强烈推荐" : score >= 55 ? "★★ 推荐" : score >= 35 ? "★ 可用" : "其他")
+                print score, stars, family, style, extension, weight, mono, chinese, ascii, file
+            }' | sort -t $'\t' -k1,1nr -k3,3f > "$temporary"
+    # 扫描失败(如 fc-list 异常)时不要用空文件覆盖仍然有效的旧缓存
+    if [[ -s "$temporary" ]]; then
+        mv -- "$temporary" "$output"
+    else
+        rm -f -- "$temporary"
+        return 1
+    fi
+    [[ -s "$output" ]]
+}
+
+fftools_font_cache() {
+    local refresh="${1:-false}"
+    if [[ "$refresh" == true || ! -s "$FFTOOLS_FONT_CACHE" ]]; then
+        fftools_scan_fonts "$FFTOOLS_FONT_CACHE" || return 1
+    fi
+    printf '%s\n' "$FFTOOLS_FONT_CACHE"
+}
+
+fftools_font_family() {
+    local font_file="$1" cache
+    cache=$(fftools_font_cache) || return 1
+    awk -F '\t' -v file="$font_file" '$10 == file { print $3; exit }' "$cache"
+}
+
+fftools_pick_font() {
+    require_tools fzf fc-list || return 1
+    local cache selection category source
+    cache=$(fftools_font_cache "${1:-false}") || return 1
+    category=$(printf '%s\n' \
+        $'⭐ 推荐字体\trecommended' $'中文字体\tchinese' $'等宽/编程字体\tmono' \
+        $'全部本地字体\tall' $'重新扫描字体库\trefresh' |
+        fzf --height 35% --delimiter=$'\t' --with-nth=1 --header '① 字体 · 选择字体分类' |
+        cut -f2) || return 1
+    if [[ "$category" == refresh ]]; then
+        cache=$(fftools_font_cache true) || return 1
+        category=all
+    fi
+    case "$category" in
+        recommended) source=$(awk -F '\t' '$1 >= 55' "$cache") ;;
+        chinese) source=$(awk -F '\t' '$8 == "是"' "$cache") ;;
+        mono) source=$(awk -F '\t' '$7 == "是"' "$cache") ;;
+        *) source=$(<"$cache") ;;
+    esac
+    [[ -n "$source" ]] || source=$(<"$cache")
+    selection=$(printf '%s\n' "$source" | fzf --height 80% --delimiter=$'\t' \
+        --with-nth='2,3,4,5,7,8' --header '① 字体 · 推荐度 / 名称 / 样式 / 格式 / 等宽 / 中文' \
+        --preview 'printf "字体：%s\n样式：%s\n格式：%s\n字重：%s\n等宽：%s\n中文：%s\nASCII：%s\n\n路径：\n%s\n" {3} {4} {5} {6} {7} {8} {9} {10}' \
+        --preview-window 'down:35%:wrap') || return 1
+    IFS=$'\t' read -r FFTOOLS_FONT_SCORE FFTOOLS_FONT_RATING FFTOOLS_FONT_FAMILY \
+        FFTOOLS_FONT_STYLE FFTOOLS_FONT_FORMAT FFTOOLS_FONT_WEIGHT FFTOOLS_FONT_MONO \
+        FFTOOLS_FONT_CHINESE FFTOOLS_FONT_ASCII FFTOOLS_FONT_FILE <<< "$selection"
+    export FFTOOLS_FONT_SCORE FFTOOLS_FONT_RATING FFTOOLS_FONT_FAMILY FFTOOLS_FONT_STYLE
+    export FFTOOLS_FONT_FORMAT FFTOOLS_FONT_WEIGHT FFTOOLS_FONT_MONO FFTOOLS_FONT_CHINESE
+    export FFTOOLS_FONT_ASCII FFTOOLS_FONT_FILE
+    printf '%s\n' "$FFTOOLS_FONT_FILE"
+}
+
+fftools_unique_characters() {
+    awk 'BEGIN { RS="" } { for (i=1; i<=length($0); i++) { c=substr($0,i,1); if (!seen[c]++) printf "%s", c } }'
+}
+
+fftools_pick_characters() {
+    require_tools fzf || return 1
+    local selected custom result
+    selected=$(printf '%s\n' \
+        $'大写字母 A-Z\tABCDEFGHIJKLMNOPQRSTUVWXYZ' \
+        $'小写字母 a-z\tabcdefghijklmnopqrstuvwxyz' \
+        $'数字 0-9\t0123456789' \
+        $'常用符号\t.,!?;:()[]{}+-=*/_%@#&<>~' \
+        $'中文常用字\t的一是不了人我在有他这为之大来以个中上们到说国和地也子时道出而要于就下得可你年生自会那后能对着事其里所去行过家十用发天如然作方成者多日都三小军二无同么经法当起与好看学进种将还分此心前面又定见只主没公从知全工使情明性长现理些实' |
+        fzf --multi --height 60% --delimiter=$'\t' --with-nth=1 \
+            --bind 'ctrl-a:select-all,ctrl-x:deselect-all' \
+            --header '② 字符 · Tab 多选 · Ctrl-A 全选') || return 1
+    result=$(printf '%s\n' "$selected" | cut -f2 | tr -d '\n')
+    read -r -p '自定义字符（可留空）: ' custom
+    printf '%s%s' "$result" "$custom" | fftools_unique_characters
+}
+
+fftools_pick_font_size() {
+    require_tools fzf || return 1
+    local default="${1:-16}" selected
+    selected=$(printf '%s\n' 8 10 12 14 16 18 20 24 32 自定义 |
+        fzf --height 45% --header "③ 字号 · 默认 ${default}px") || return 1
+    if [[ "$selected" == 自定义 ]]; then
+        read -r -p "字体大小 [${default}]: " selected
+        selected=${selected:-$default}
+    fi
+    [[ "$selected" =~ ^[1-9][0-9]{0,2}$ ]] || { printf '无效字号: %s\n' "$selected" >&2; return 2; }
+    printf '%s\n' "$selected"
+}
+
+fftools_font_summary() {
+    local text="${1:-}" font_file="${2:-${FFTOOLS_FONT_FILE:-}}" size="${3:-16}"
+    local count=${#text} estimated family="${FFTOOLS_FONT_FAMILY:-}"
+    [[ -z "$family" && -n "$font_file" ]] && family=$(fftools_font_family "$font_file" 2>/dev/null || true)
+    estimated=$((count * size * size / 2))
+    printf '\n④ 预览 & 烧录\n字体：%s\n字号：%s px\n字符：%s 个\n预计字形位图：约 %s KiB\n' \
+        "${family:-${font_file:-系统默认}}" "$size" "$count" "$((estimated / 1024 + 1))"
+}
+
+# ── 构建链式 atempo 滤镜（处理 0.5~2.0 范围外的速度）─────
+build_atempo_chain() {
+    local factor="$1"
+    local filters=()
+    local remaining="$factor"
+    while awk "BEGIN{exit !($remaining>2.0)}"; do
+        filters+=("atempo=2.0")
+        remaining=$(awk "BEGIN{printf \"%.4f\", $remaining/2.0}")
+    done
+    while awk "BEGIN{exit !($remaining<0.5)}"; do
+        filters+=("atempo=0.5")
+        remaining=$(awk "BEGIN{printf \"%.4f\", $remaining/0.5}")
+    done
+    filters+=("atempo=$remaining")
+    local IFS=','
+    printf '%s\n' "${filters[*]}"
+}
+
+# ── 检查多个视频文件的编码参数是否一致 ─────────────────
+# 返回 0=一致/不足2个文件, 1=读取失败, 2=参数不一致
+check_video_consistency() {
+    local files=("$@")
+    (( ${#files[@]} < 2 )) && return 0
+    local first_params rest_params
+    first_params=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name,width,height,r_frame_rate \
+        -of csv=p=0 -- "${files[0]}" 2>/dev/null) || return 1
+    for f in "${files[@]:1}"; do
+        rest_params=$(ffprobe -v error -select_streams v:0 \
+            -show_entries stream=codec_name,width,height,r_frame_rate \
+            -of csv=p=0 -- "$f" 2>/dev/null) || return 1
+        [[ "$first_params" == "$rest_params" ]] || return 2
+    done
+    return 0
+}
+
+# ── 检测视频是否为 HDR ─────────────────────────────────
+detect_hdr() {
+    local file="$1"
+    local info
+    info=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=color_space,color_transfer,color_primaries \
+        -of csv=p=0 -- "$file" 2>/dev/null) || return 1
+    [[ "$info" == *"bt2020"* || "$info" == *"smpte2084"* ]]
+}
+
+# ── 自动检测最佳硬件加速方案 ────────────────────────────
+hw_accel_auto() {
+    if ffmpeg -hide_banner -hwaccels 2>/dev/null | grep -q "cuda"; then
+        echo "cuda"
+    elif ffmpeg -hide_banner -hwaccels 2>/dev/null | grep -q "qsv"; then
+        echo "qsv"
+    elif ffmpeg -hide_banner -hwaccels 2>/dev/null | grep -q "vaapi"; then
+        echo "vaapi"
+    fi
+}
+
+# ── 标准化音频滤镜 ─────────────────────────────────────
+loudnorm_filter() {
+    echo "loudnorm=I=-16:TP=-1.5:LRA=11"
+}
+
+# ── 自动检测电池路径 ───────────────────────────────────
+detect_battery() {
+    for bat in /sys/class/power_supply/BAT{0,1,2}; do
+        [[ -f "$bat/capacity" ]] && echo "$bat" && return 0
+    done
+    return 1
+}
+
+# ── pick_subtitle: 选择字幕文件 ─────────────────────────
+pick_subtitle() {
+    media_candidates '\.(srt|ass|ssa|vtt|sub|idx)$' |
+        pick_with_preview '选择字幕文件 · Ctrl-P 切换预览'
+}
+
+# ── pick_subtitles: 多选字幕文件 ───────────────────────
+pick_subtitles() {
+    media_candidates '\.(srt|ass|ssa|vtt|sub|idx)$' |
+        pick_multi_with_preview '选择字幕文件 · Tab 多选 · Ctrl-A 全选'
+}

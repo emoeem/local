@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# fzf-ffmpeg-builder: 命令构建器 — 编码器+滤镜+硬件加速
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/fzf-fftools-lib"
+
+input="${1:-}"
+if [[ -z "$input" ]]; then
+    require_tools fzf fd || exit 1
+    input=$(pick_video) || exit 0
+fi
+base="${input%.*}"
+
+echo "── 视频滤镜（可选，回车跳过）──"
+echo -n "裁剪 crop=w:h:x:y: "; read -r crop || true
+echo -n "缩放 scale=w:h: "; read -r scale || true
+echo -n "帧率 fps=N: "; read -r fps || true
+echo -n "硬件解码 [cuda/qsv/vaapi/留空=无]: "; read -r hw || true
+
+venc=$(printf '%s\n' "${VENC_LIST[@]}" | grep -v '^──' | fzf "${FZF_BASE[@]}" --header '🎬 视频编码器' \
+    --preview 'echo -e "编码器: {1}\n{2}\n{3}"' | awk '{print $1}') || exit 0
+aenc=$(printf '%s\n' "${AENC_LIST[@]}" | grep -v '^──' | fzf "${FZF_BASE[@]}" --header '🎵 音频编码器' | awk '{print $1}') || exit 0
+
+# 预设/质量
+pflag=""; preset=""; qflag=""; quality=""
+for p in "${PSMAP[@]}"; do [[ "$p" == "$venc:"* ]] && { IFS=: read -r _ pflag prange pdefault <<< "$p"
+    preset=$(echo "$prange" | tr '~' '\n' | fzf --height 25% --header "$pflag") || preset=""
+    [[ -z "$preset" ]] && preset="$pdefault"; break; }; done
+for q in "${QMAP[@]}"; do [[ "$q" == "$venc:"* ]] && { IFS=: read -r _ qflag qrange qdefault <<< "$q"
+    echo -n "$qflag [$qrange] 默认 $qdefault: "; read -r quality || true
+    [[ -z "$quality" ]] && quality="$qdefault"; break; }; done
+
+# 校验输入并构建滤镜字符串（提示只要求填值，前缀在这里补上）
+if [[ -n "$crop" && ! "$crop" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+$ ]]; then
+    printf '⚠️ crop 应为 w:h:x:y 四个数字，已忽略: %s\n' "$crop" >&2
+    crop=""
+fi
+if [[ -n "$scale" && ( "$scale" != *:* || "$scale" == *:*:* ) ]]; then
+    printf '⚠️ scale 应为 w:h (如 1280:720 或 -2:720)，已忽略: %s\n' "$scale" >&2
+    scale=""
+fi
+if [[ -n "$fps" && ! "$fps" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    printf '⚠️ fps 应为数字，已忽略: %s\n' "$fps" >&2
+    fps=""
+fi
+vf=""
+[[ -n "$crop"  ]] && vf="${vf:+$vf,}crop=$crop"
+[[ -n "$scale" ]] && vf="${vf:+$vf,}scale=$scale"
+[[ -n "$fps"   ]] && vf="${vf:+$vf,}fps=$fps"
+echo -n "输出 [$base.mp4]: "; read -r out || true; [[ -z "$out" ]] && out="${base}.mp4"
+
+# 用数组构建命令（避免字符串拼接中的引号问题）
+cmd=(ffmpeg)
+[[ -n "$hw" ]] && cmd+=(-hwaccel "$hw")
+cmd+=(-i "$input")
+[[ -n "$vf" ]] && cmd+=(-vf "$vf")
+
+case "$venc" in
+    copy) cmd+=(-c:v copy) ;;
+    -vn)  cmd+=(-vn) ;;
+    "")   cmd+=(-c:v copy) ;;
+    *)
+        cmd+=(-c:v "$venc")
+        [[ -n "$preset" ]] && cmd+=($pflag "$preset")
+        [[ -n "$quality" ]] && cmd+=($qflag "$quality")
+        local_pix=$(pix_fmt "$venc")
+        [[ -n "$local_pix" ]] && cmd+=($local_pix)
+        ;;
+esac
+
+case "$aenc" in
+    copy) cmd+=(-c:a copy) ;;
+    -an)  cmd+=(-an) ;;
+    "")   cmd+=(-c:a copy) ;;
+    *)    cmd+=(-c:a "$aenc") ;;
+esac
+
+cmd+=(-y "$out")
+
+# 使用 confirm_run_cmd 避免字符串拼接引号问题
+confirm_run_cmd "${cmd[@]}"

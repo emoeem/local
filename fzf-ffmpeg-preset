@@ -1,0 +1,31 @@
+#!/bin/bash
+# fzf-ffmpeg-preset: 快速预设 — 源自 FFmpegFreeUI 内置方案
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/fzf-fftools-lib"
+
+PRESETS=(
+    "RTX50_AV1_标准  RTX50 NVENC AV1 常规 | -preset p7 -cq 36"
+    "RTX50_AV1_UHQ  NVENC AV1 UHQ 最佳平衡 | -preset p7 -tune uhq -cq 38"
+    "RTX50_HEVC_UHQ NVENC HEVC 满分答案   | -preset p7 -tune uhq -cq 28"
+    "x265_推荐      x265 slow+crf24 通用  | x265 软件"
+    "x264_推荐      x264 slower+crf23    | x264 软件"
+    "AVIF_图片      AOM AV1 压图         | 图片输出"
+)
+sel=$(printf '%s\n' "${PRESETS[@]}" | fzf "${FZF_BASE[@]}" --header '快速预设' \
+    --preview 'echo "{2}"' --preview-window 'bottom:1' | awk '{print $1}') || exit
+input="${1:-}"
+if [[ -z "$input" ]]; then
+    input=$(pick_video) || exit
+fi
+base="${input%.*}"
+
+case "$sel" in
+    RTX50_AV1_标准)  cmd=(ffmpeg -hwaccel cuda -i "$input" -c:v av1_nvenc -preset p7 -cq 36 -pix_fmt p010le "${base}_av1.mp4") ;;
+    RTX50_AV1_UHQ)  cmd=(ffmpeg -hwaccel cuda -i "$input" -c:v av1_nvenc -preset p7 -tune uhq -cq 38 -pix_fmt p010le "${base}_av1_uhq.mp4") ;;
+    RTX50_HEVC_UHQ) cmd=(ffmpeg -hwaccel cuda -i "$input" -c:v hevc_nvenc -preset p7 -tune uhq -cq 28 -pix_fmt p010le "${base}_hevc.mp4") ;;
+    x265_推荐)      cmd=(ffmpeg -i "$input" -c:v libx265 -preset slow -crf 24 -pix_fmt yuv420p10le "${base}_x265.mp4") ;;
+    x264_推荐)      cmd=(ffmpeg -i "$input" -c:v libx264 -preset slower -crf 23 -pix_fmt yuv420p10le "${base}_x264.mp4") ;;
+    AVIF_图片)      cmd=(ffmpeg -i "$input" -c:v libaom-av1 -cpu-used 1 -crf 18 -b:v 0 -aom-params tune=iq -still-picture 1 -row-mt 1 "${base}.avif") ;;
+esac
+
+confirm_run_cmd "${cmd[@]}"

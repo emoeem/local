@@ -1,0 +1,230 @@
+#!/bin/bash
+# fzf-merge-av:summary=智能匹配分离的音视频文件并合并，自动跳过已完成项。
+
+set -euo pipefail
+
+target_dir="${1:-.}"
+for tool in fzf ffmpeg ffprobe find sort du; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "❌ 缺少依赖: $tool" >&2; exit 1; }
+done
+if ! cd "$target_dir" 2>/dev/null; then
+    echo "❌ 无法进入目录: $target_dir" >&2
+    exit 1
+fi
+
+# ═══════════════════════════════════════════════════════════════
+# 工具函数
+# ═══════════════════════════════════════════════════════════════
+
+normalize_stem() {
+    local f="$1"
+    local base="${f%.*}"
+    local markers=(
+        ".video_only" ".audio_only"
+        ".video"      ".audio"
+        ".vi"         ".au"
+        "_video_only" "_audio_only"
+        "_video"      "_audio"
+    )
+    for m in "${markers[@]}"; do
+        if [[ "$base" == *"$m" ]]; then
+            local stem="${base%"$m"}"
+            if [[ "$stem" != "$base" ]] && [[ -n "$stem" ]]; then
+                echo "$stem"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+# 快速验证文件是否可读且包含预期的流
+validate_media() {
+    local file="$1" expected_type="$2"  # video or audio
+    local streams
+    streams=$(ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$file" 2>/dev/null) || return 1
+    [[ "$streams" == *"$expected_type"* ]] || return 1
+    return 0
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 扫描配对
+# ═══════════════════════════════════════════════════════════════
+
+declare -A vfile_map
+declare -A afile_map
+
+video_exts=(-iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' -o -iname '*.mov' -o -iname '*.avi' -o -iname '*.flv' -o -iname '*.m4v')
+audio_exts=(-iname '*.m4a' -o -iname '*.mp3' -o -iname '*.aac' -o -iname '*.opus' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.flac')
+
+while IFS= read -r -d '' file; do
+    fname=$(basename "$file")
+    stem=$(normalize_stem "$fname") || continue
+    [[ -z "$stem" ]] && continue
+    ext="${fname##*.}"
+    ext="${ext,,}"
+    case "$ext" in
+        mp4|mkv|webm|mov|avi|flv|m4v|ts)
+            [[ -z "${vfile_map[$stem]+x}" ]] && vfile_map["$stem"]="$fname" ;;
+        m4a|mp3|aac|opus|ogg|wav|flac)
+            [[ -z "${afile_map[$stem]+x}" ]] && afile_map["$stem"]="$fname" ;;
+    esac
+done < <(find . -maxdepth 1 -type f \( "${video_exts[@]}" -o "${audio_exts[@]}" \) -print0 2>/dev/null | sort -z)
+
+# ── 收集配对，分类：待合并 / 已完成 ──────────────────────
+declare -a pending=()
+declare -a done_already=()
+declare -a invalid=()
+
+for stem in "${!vfile_map[@]}"; do
+    [[ -z "${afile_map[$stem]+x}" ]] && continue
+    vf="${vfile_map[$stem]}"
+    af="${afile_map[$stem]}"
+    output="${stem}.mp4"
+
+    # 验证文件
+    v_ok=true; a_ok=true
+    validate_media "$vf" "video" || v_ok=false
+    validate_media "$af" "audio" || a_ok=false
+
+    if ! $v_ok || ! $a_ok; then
+        invalid+=("$stem")
+    elif [[ -f "$output" ]]; then
+        done_already+=("$stem")
+    else
+        pending+=("$stem")
+    fi
+done
+
+# 排序（空数组跳过：printf 空数组会输出一个空行，导致 mapfile 得到含空串的数组）
+if (( ${#pending[@]} > 0 )); then
+    mapfile -t pending < <(printf '%s\n' "${pending[@]}" | sort)
+fi
+if (( ${#done_already[@]} > 0 )); then
+    mapfile -t done_already < <(printf '%s\n' "${done_already[@]}" | sort)
+fi
+if (( ${#invalid[@]} > 0 )); then
+    mapfile -t invalid < <(printf '%s\n' "${invalid[@]}" | sort)
+fi
+
+# ═══════════════════════════════════════════════════════════════
+# 状态报告
+# ═══════════════════════════════════════════════════════════════
+
+echo "📊 扫描结果:"
+echo "   待合并: ${#pending[@]} 个"
+echo "   已完成: ${#done_already[@]} 个"
+echo "   有问题: ${#invalid[@]} 个"
+for stem in "${invalid[@]}"; do
+    [[ -z "$stem" ]] && continue
+    echo "     ⚠️  ${vfile_map[$stem]} + ${afile_map[$stem]} — 文件可能损坏"
+done
+echo ""
+
+if [[ ${#pending[@]} -eq 0 ]]; then
+    if [[ ${#done_already[@]} -gt 0 ]]; then
+        echo "✅ 所有配对已完成合并。"
+    else
+        echo "❌ 未找到可合并的音视频分离文件。"
+    fi
+    exit 0
+fi
+
+# ═══════════════════════════════════════════════════════════════
+# fzf 多选（仅待合并项，默认全选）
+# ═══════════════════════════════════════════════════════════════
+
+fzf_input=""
+for stem in "${pending[@]}"; do
+    [[ -z "$stem" ]] && continue
+    vf="${vfile_map[$stem]}"
+    af="${afile_map[$stem]}"
+    vs=$(du -h "$vf" 2>/dev/null | cut -f1)
+    aus=$(du -h "$af" 2>/dev/null | cut -f1)
+    printf -v line '%s\t%s\t📹%s  🎵%s\t%s\t%s\n' "$stem" "$stem" "$vs" "$aus" "$vf" "$af"
+    fzf_input+="$line"
+done
+
+# 如果有已完成的，追加到列表末尾（灰色标记，仅供参考）
+if [[ ${#done_already[@]} -gt 0 ]]; then
+    for stem in "${done_already[@]}"; do
+        [[ -z "$stem" ]] && continue
+        vf="${vfile_map[$stem]-}"
+        af="${afile_map[$stem]-}"
+        [[ -z "$vf" || -z "$af" ]] && continue
+        vs=$(du -h "$vf" 2>/dev/null | cut -f1)
+        aus=$(du -h "$af" 2>/dev/null | cut -f1)
+        printf -v line '%s	✅ %s (已合并)	📹%s  🎵%s	%s	%s
+' "$stem" "$stem" "$vs" "$aus" "$vf" "$af"
+        fzf_input+="$line"
+    done
+fi
+
+fzf_args=(
+    --multi
+    --height 100%
+    --delimiter='\t'
+    --with-nth=2,3
+    --bind 'start:select-all'
+    --bind 'ctrl-a:select-all'
+    --bind 'ctrl-x:deselect-all'
+    --preview 'v={4}; a={5}; s={1}; echo "视频: $v  ($(du -h "$v" | cut -f1))"; echo "音频: $a  ($(du -h "$a" | cut -f1))"; echo "输出: $s.mp4"; if [[ -f "$s.mp4" ]]; then echo "状态: 已存在，将跳过"; else echo "状态: 等待合并"; fi; echo ""; fzf-preview-video "$v"'
+    --preview-window 'right:60%:nowrap:border-left'
+    --bind 'ctrl-w:toggle-preview-wrap'
+    --preview-label='配对详情'
+    --header 'Tab: 选择/取消  Ctrl-A: 全选  Ctrl-X: 取消全部  Enter: 开始合并'
+    --color 'pointer:green,marker:green'
+)
+
+selected=$(echo "$fzf_input" | SHELL=/bin/bash fzf "${fzf_args[@]}" | cut -f1) || { echo "未选择任何文件。"; exit 0; }
+
+if [[ -z "$selected" ]]; then
+    echo "未选择任何文件。"
+    exit 0
+fi
+
+# ═══════════════════════════════════════════════════════════════
+# 逐个合并（跳过已有输出文件的）
+# ═══════════════════════════════════════════════════════════════
+
+total=0
+fail=0
+skip=0
+while IFS= read -r stem; do
+    [[ -z "$stem" ]] && continue
+    video="${vfile_map[$stem]}"
+    audio="${afile_map[$stem]}"
+    output="${stem}.mp4"
+
+    if [[ -f "$output" ]]; then
+        echo "⏭  跳过: $stem — $output 已存在"
+        ((++skip))
+        continue
+    fi
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "[$((total+fail+skip+1))] $stem"
+    echo "    📹 $video  ($(du -h "$video" | cut -f1))"
+    echo "    🎵 $audio  ($(du -h "$audio" | cut -f1))"
+    echo "    ➡  $output"
+    echo ""
+
+    if ffmpeg -i "$video" -i "$audio" \
+        -c copy -map 0:v -map 1:a \
+        -y "$output"; then
+        echo "  ✅ 完成"
+        ((++total))
+    elif ffmpeg -i "$video" -i "$audio" \
+        -c:v copy -c:a aac -b:a 192k -map 0:v -map 1:a \
+        -y "$output"; then
+        echo "  ✅ 完成 (音频已转码 AAC)"
+        ((++total))
+    else
+        echo "  ❌ 失败"
+        ((++fail))
+    fi
+    echo ""
+done <<< "$selected"
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "完成: 成功 $total, 跳过 $skip, 失败 $fail"

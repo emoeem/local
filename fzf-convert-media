@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# fzf-convert-media:summary=Smart media converter — auto-detect type and offer matching formats via fzf.
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/fzf-fftools-lib"
+
+require_tools ffmpeg ffprobe || exit 1
+
+detect_type() {
+    local file="$1" ext="${file##*.}"; ext="${ext,,}"
+    case "$ext" in
+        mp4|mkv|webm|mov|avi|flv|m4v|ts|wmv|3gp) echo "video" ; return ;;
+        m4a|mp3|aac|opus|ogg|wav|flac|wma|ac3)    echo "audio" ; return ;;
+        jpg|jpeg|png|webp|gif|bmp|tiff|tif|avif|heic|svg) echo "image" ; return ;;
+    esac
+    local streams
+    streams=$(ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$file" 2>/dev/null || true)
+    if   [[ "$streams" == *"video"* ]]; then echo "video"
+    elif [[ "$streams" == *"audio"* ]]; then echo "audio"
+    else echo "unknown"; fi
+}
+
+# ── 格式选择菜单 ────────────────────────────────────────────
+
+video_menu() {
+    printf '%s\n' \
+        '── 通用 ──' \
+        'mp4         H.264+AAC, 兼容性最好' \
+        'mkv         H.264+AAC, 封装灵活, 可挂字幕' \
+        '── 高效编码 ──' \
+        'mp4-hevc    H.265+AAC, 体积比H.264小一半' \
+        'mkv-hevc    H.265+AAC, 最新编码' \
+        '── 网页 ──' \
+        'webm-vp9    VP9+Opus, 现代浏览器' \
+        'webm-vp8    VP8+Vorbis, 兼容老旧浏览器' \
+        '── Apple ──' \
+        'mov         H.264+AAC, QuickTime' \
+        'm4v         iTunes/Apple 视频' \
+        '── 其他容器 ──' \
+        'avi         H.264+AAC, 老旧格式' \
+        'flv         H.264+AAC, Flash' \
+        'ts          MPEG-TS, 广播/流媒体' \
+        'wmv         Windows Media' \
+        '3gp         老式移动设备' \
+        '── 特殊 ──' \
+        'gif         动图 (低质量, 推荐用 fzf-video-to-gif)' \
+        | fzf "${FZF_BASE[@]}" --height 80% --header '选择目标格式 (视频)'
+}
+
+audio_menu() {
+    printf '%s\n' \
+        '── MP3 ──' \
+        'mp3-320     MP3 320kbps, 高品质' \
+        'mp3-192     MP3 192kbps, 标准' \
+        'mp3-128     MP3 128kbps, 体积小' \
+        '── AAC ──' \
+        'm4a-256     AAC 256kbps, 接近无损' \
+        'm4a-192     AAC 192kbps, 标准' \
+        'm4a-128     AAC 128kbps, 体积小' \
+        'aac         AAC 192kbps, 纯音频流(.aac)' \
+        '── 高效编码 ──' \
+        'opus-128    Opus 128kbps, 最佳性价比' \
+        'opus-64     Opus 64kbps, 极小体积' \
+        '── 无损 ──' \
+        'flac        FLAC 无损压缩, 体积约减半' \
+        'alac        ALAC Apple 无损' \
+        'wav         WAV 16bit PCM, 无压缩' \
+        '── 其他 ──' \
+        'ogg         Vorbis, 开源格式' \
+        'ac3         Dolby Digital, 5.1环绕' \
+        | fzf "${FZF_BASE[@]}" --height 80% --header '选择目标格式 (音频)'
+}
+
+image_menu() {
+    printf '%s\n' \
+        '── JPEG ──' \
+        'jpg-90      JPEG 质量90, 高品质' \
+        'jpg-75      JPEG 质量75, 标准' \
+        'jpg-50      JPEG 质量50, 体积小' \
+        '── 无损 ──' \
+        'png         PNG 无损, 支持透明通道' \
+        'webp-ll     WebP 无损, 比PNG小30%' \
+        'tiff        TIFF 无损, 印刷/存档用' \
+        'bmp         BMP 无压缩位图' \
+        '── 新一代 ──' \
+        'webp-80     WebP 有损, 比JPEG小40%' \
+        'avif        AVIF, 最新格式, 压缩率最高' \
+        | fzf "${FZF_BASE[@]}" --height 60% --header '选择目标格式 (图片)'
+}
+
+# ── 主流程 ──────────────────────────────────────────────────
+
+file="${1:-}"
+target="${2:-}"
+if [[ -z "$file" ]]; then
+    require_tools fzf fd || exit 1
+    file=$(pick_media) || exit 0
+    [[ -z "$file" ]] && exit 0
+fi
+
+printf '验证 %s ... ' "$file"
+if ! ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$file" 2>/dev/null | grep -q .; then
+    echo "❌ 文件无效"
+    exit 1
+fi
+echo "✅"
+
+ftype=$(detect_type "$file")
+echo "检测到类型: $ftype"
+echo ""
+
+if [[ -z "$target" ]]; then
+    case "$ftype" in
+        video) target=$(video_menu) || exit 0 ;;
+        audio) target=$(audio_menu) || exit 0 ;;
+        image) target=$(image_menu) || exit 0 ;;
+        *)     echo "❌ 无法识别文件类型"; exit 1 ;;
+    esac
+fi
+
+[[ -z "$target" ]] && exit 0
+
+# 解析目标格式
+ext="${target%% *}"
+ext="${ext%%-*}"
+
+output="${file%.*}.${ext}"
+read -r -p "输出 [$output]: " custom || true
+output="${custom:-$output}"
+if [[ "$(realpath -m -- "$output")" == "$(realpath -m -- "$file")" ]]; then
+    output="${file%.*}.converted.${ext}"
+    echo "⚠️  输出与输入相同，已改为: $output"
+fi
+echo "→ $output"
+
+# 根据目标格式构建命令数组
+status=0
+case "$target" in
+    # ── 视频 ──────────────────────────────
+    mp4-hevc*)  fftools_run ffmpeg -i "$file" -c:v libx265 -preset medium -crf 23 -pix_fmt yuv420p10le -c:a aac -b:a 192k -movflags +faststart -y "$output" || status=$? ;;
+    mkv-hevc*)  fftools_run ffmpeg -i "$file" -c:v libx265 -preset medium -crf 23 -pix_fmt yuv420p10le -c:a aac -b:a 192k -y "$output" || status=$? ;;
+    mp4*)       fftools_run ffmpeg -i "$file" -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart -y "$output" || status=$? ;;
+    mkv*)       fftools_run ffmpeg -i "$file" -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a aac -b:a 192k -y "$output" || status=$? ;;
+    webm-vp9*)  fftools_run ffmpeg -i "$file" -c:v libvpx-vp9 -crf 32 -b:v 0 -c:a libopus -y "$output" || status=$? ;;
+    webm-vp8*)  fftools_run ffmpeg -i "$file" -c:v libvpx -crf 10 -b:v 1M -c:a libvorbis -y "$output" || status=$? ;;
+    mov*)       fftools_run ffmpeg -i "$file" -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a aac -y "$output" || status=$? ;;
+    m4v*)       fftools_run ffmpeg -i "$file" -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a aac -y "$output" || status=$? ;;
+    avif*)      fftools_run ffmpeg -i "$file" -c:v libaom-av1 -still-picture 1 -y "$output" || status=$? ;;
+    avi*)       fftools_run ffmpeg -i "$file" -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a aac -y "$output" || status=$? ;;
+    flv*)       fftools_run ffmpeg -i "$file" -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a aac -y "$output" || status=$? ;;
+    ts*)        fftools_run ffmpeg -i "$file" -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a aac -y "$output" || status=$? ;;
+    wmv*)       fftools_run ffmpeg -i "$file" -c:v wmv2 -c:a wmav2 -y "$output" || status=$? ;;
+    3gp*)       fftools_run ffmpeg -i "$file" -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a aac -s 320x240 -y "$output" || status=$? ;;
+    gif*)       echo "💡 高质量GIF推荐: fzf-video-to-gif"; fftools_run ffmpeg -i "$file" -vf "fps=10,scale=480:-1:flags=lanczos" -y "$output" || status=$? ;;
+
+    # ── 音频 ──────────────────────────────
+    mp3-320*)  fftools_run ffmpeg -i "$file" -vn -c:a libmp3lame -b:a 320k -y "$output" || status=$? ;;
+    mp3-192*)  fftools_run ffmpeg -i "$file" -vn -c:a libmp3lame -b:a 192k -y "$output" || status=$? ;;
+    mp3-128*)  fftools_run ffmpeg -i "$file" -vn -c:a libmp3lame -b:a 128k -y "$output" || status=$? ;;
+    m4a-256*)  fftools_run ffmpeg -i "$file" -vn -c:a aac -b:a 256k -y "$output" || status=$? ;;
+    m4a-192*)  fftools_run ffmpeg -i "$file" -vn -c:a aac -b:a 192k -y "$output" || status=$? ;;
+    m4a-128*)  fftools_run ffmpeg -i "$file" -vn -c:a aac -b:a 128k -y "$output" || status=$? ;;
+    aac*)      fftools_run ffmpeg -i "$file" -vn -c:a aac -b:a 192k -y "$output" || status=$? ;;
+    opus-128*) fftools_run ffmpeg -i "$file" -vn -c:a libopus -b:a 128k -y "$output" || status=$? ;;
+    opus-64*)  fftools_run ffmpeg -i "$file" -vn -c:a libopus -b:a 64k -y "$output" || status=$? ;;
+    flac*)     fftools_run ffmpeg -i "$file" -vn -c:a flac -y "$output" || status=$? ;;
+    alac*)     fftools_run ffmpeg -i "$file" -vn -c:a alac -y "$output" || status=$? ;;
+    wav*)      fftools_run ffmpeg -i "$file" -vn -c:a pcm_s16le -y "$output" || status=$? ;;
+    ogg*)      fftools_run ffmpeg -i "$file" -vn -c:a libvorbis -b:a 192k -y "$output" || status=$? ;;
+    ac3*)      fftools_run ffmpeg -i "$file" -vn -c:a ac3 -b:a 448k -y "$output" || status=$? ;;
+
+    # ── 图片 ──────────────────────────────
+    jpg-90*)   fftools_run ffmpeg -i "$file" -q:v 1 -y "$output" || status=$? ;;
+    jpg-75*)   fftools_run ffmpeg -i "$file" -q:v 2 -y "$output" || status=$? ;;
+    jpg-50*)   fftools_run ffmpeg -i "$file" -q:v 8 -y "$output" || status=$? ;;
+    png*)      fftools_run ffmpeg -i "$file" -y "$output" || status=$? ;;
+    webp-80*)  fftools_run ffmpeg -i "$file" -c:v libwebp -quality 80 -y "$output" || status=$? ;;
+    webp-ll*)  fftools_run ffmpeg -i "$file" -c:v libwebp -lossless 1 -y "$output" || status=$? ;;
+    tiff*)     fftools_run ffmpeg -i "$file" -y "$output" || status=$? ;;
+    bmp*)      fftools_run ffmpeg -i "$file" -y "$output" || status=$? ;;
+    *)         echo "❌ 不支持的格式: $target"; exit 1 ;;
+esac
+
+if (( status == 0 )); then echo "✅ 完成"; else echo "❌ 失败"; exit "$status"; fi

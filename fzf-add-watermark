@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+# Add text or image watermarks to still images, animated images and videos.
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/fzf-fftools-lib"
+
+usage() {
+    cat <<'EOF'
+用法:
+  fzf-add-watermark [选项] [输入文件]
+
+水印:
+  --text TEXT              添加文字水印
+  --logo FILE              添加图片水印
+  --position POS           top-left/top-center/top-right/center-left/center/
+                           center-right/bottom-left/bottom-center/bottom-right
+  --margin PX              距边缘距离，默认 24
+  --opacity 0..1           不透明度，默认 0.85
+
+文字选项:
+  --font-size PX           字号，默认按画面高度计算
+  --font-color COLOR       FFmpeg 颜色名或 #RRGGBB，默认 white
+  --font FILE              字体文件
+  --style STYLE            none/box/shadow/border，默认 border
+
+图片选项:
+  --scale PERCENT          水印宽度占画面宽度百分比，默认 15
+
+输出:
+  -o, --output FILE        输出路径
+  -y, --yes                不再确认，直接覆盖输出
+  --no-preview             完成后不显示结果预览
+  -h, --help               显示帮助
+
+示例:
+  fzf-add-watermark --text '旅行 2026' photo.jpg
+  fzf-add-watermark --logo logo.png --scale 18 video.mp4
+EOF
+}
+
+die() {
+    printf '错误: %s\n' "$*" >&2
+    exit 1
+}
+
+is_number_in_range() {
+    local value="$1" minimum="$2" maximum="$3"
+    [[ "$value" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] || return 1
+    awk -v value="$value" -v minimum="$minimum" -v maximum="$maximum" \
+        'BEGIN { exit !(value >= minimum && value <= maximum) }'
+}
+
+prompt_number() {
+    local variable="$1" prompt="$2" default="$3" minimum="$4" maximum="$5"
+    local value="${!variable:-}"
+    if [[ -z "$value" && "${assume_yes:-0}" -eq 1 ]]; then
+        value="$default"
+    fi
+    if [[ -n "$value" ]] && ! is_number_in_range "$value" "$minimum" "$maximum" &&
+        [[ "${assume_yes:-0}" -eq 1 ]]; then
+        die "$prompt 必须是 $minimum 到 $maximum 之间的数字"
+    fi
+    while [[ -z "$value" ]] || ! is_number_in_range "$value" "$minimum" "$maximum"; do
+        [[ -n "$value" ]] && printf '请输入 %s 到 %s 之间的数字。\n' "$minimum" "$maximum"
+        read -r -p "$prompt [$default]: " value
+        value="${value:-$default}"
+    done
+    printf -v "$variable" '%s' "$value"
+}
+
+filter_escape() {
+    local value="$1"
+    value=${value//\\/\\\\}
+    value=${value//:/\\:}
+    value=${value//\'/\\\'}
+    printf '%s' "$value"
+}
+
+position_expression() {
+    local position="$1" mode="$2" margin="$3"
+    local canvas_w canvas_h object_w object_h
+    if [[ "$mode" == "text" ]]; then
+        canvas_w="w"
+        canvas_h="h"
+        object_w="text_w"
+        object_h="text_h"
+    else
+        canvas_w="main_w"
+        canvas_h="main_h"
+        object_w="overlay_w"
+        object_h="overlay_h"
+    fi
+
+    case "$position" in
+        top-left)      printf '%s|%s' "$margin" "$margin" ;;
+        top-center)    printf '(%s-%s)/2|%s' "$canvas_w" "$object_w" "$margin" ;;
+        top-right)     printf '%s-%s-%s|%s' "$canvas_w" "$object_w" "$margin" "$margin" ;;
+        center-left)   printf '%s|(%s-%s)/2' "$margin" "$canvas_h" "$object_h" ;;
+        center)        printf '(%s-%s)/2|(%s-%s)/2' "$canvas_w" "$object_w" "$canvas_h" "$object_h" ;;
+        center-right)  printf '%s-%s-%s|(%s-%s)/2' "$canvas_w" "$object_w" "$margin" "$canvas_h" "$object_h" ;;
+        bottom-left)   printf '%s|%s-%s-%s' "$margin" "$canvas_h" "$object_h" "$margin" ;;
+        bottom-center) printf '(%s-%s)/2|%s-%s-%s' "$canvas_w" "$object_w" "$canvas_h" "$object_h" "$margin" ;;
+        bottom-right)  printf '%s-%s-%s|%s-%s-%s' "$canvas_w" "$object_w" "$margin" "$canvas_h" "$object_h" "$margin" ;;
+        *) return 1 ;;
+    esac
+}
+
+print_command() {
+    printf '\n执行命令:\n  '
+    printf '%q ' "$@"
+    printf '\n\n'
+}
+
+input=""
+mode=""
+text=""
+logo=""
+position=""
+margin=""
+opacity=""
+font_size=""
+font_color=""
+font_file=""
+style=""
+scale_percent=""
+output=""
+assume_yes=0
+preview_result=1
+
+while (( $# > 0 )); do
+    case "$1" in
+        --text)
+            (( $# >= 2 )) || die "--text 缺少文字"
+            mode="text"; text="$2"; shift 2
+            ;;
+        --logo)
+            (( $# >= 2 )) || die "--logo 缺少文件"
+            mode="image"; logo="$2"; shift 2
+            ;;
+        --position)
+            (( $# >= 2 )) || die "--position 缺少值"
+            position="$2"; shift 2
+            ;;
+        --margin)
+            (( $# >= 2 )) || die "--margin 缺少值"
+            margin="$2"; shift 2
+            ;;
+        --opacity)
+            (( $# >= 2 )) || die "--opacity 缺少值"
+            opacity="$2"; shift 2
+            ;;
+        --font-size)
+            (( $# >= 2 )) || die "--font-size 缺少值"
+            font_size="$2"; shift 2
+            ;;
+        --font-color)
+            (( $# >= 2 )) || die "--font-color 缺少值"
+            font_color="$2"; shift 2
+            ;;
+        --font)
+            (( $# >= 2 )) || die "--font 缺少文件"
+            font_file="$2"; shift 2
+            ;;
+        --style)
+            (( $# >= 2 )) || die "--style 缺少值"
+            style="$2"; shift 2
+            ;;
+        --scale)
+            (( $# >= 2 )) || die "--scale 缺少值"
+            scale_percent="$2"; shift 2
+            ;;
+        -o|--output)
+            (( $# >= 2 )) || die "--output 缺少文件"
+            output="$2"; shift 2
+            ;;
+        -y|--yes)
+            assume_yes=1; shift
+            ;;
+        --no-preview)
+            preview_result=0; shift
+            ;;
+        -h|--help)
+            usage; exit 0
+            ;;
+        --)
+            shift
+            while (( $# > 0 )); do
+                [[ -z "$input" ]] || die "只能指定一个输入文件"
+                input="$1"; shift
+            done
+            ;;
+        -*)
+            die "未知选项: $1"
+            ;;
+        *)
+            [[ -z "$input" ]] || die "只能指定一个输入文件"
+            input="$1"; shift
+            ;;
+    esac
+done
+
+require_tools ffmpeg ffprobe || exit 1
+
+if [[ -z "$input" ]]; then
+    require_tools fzf fd || exit 1
+    input=$(pick_visual) || exit 0
+fi
+[[ -f "$input" ]] || die "输入文件不存在: $input"
+
+if ! ffprobe -v error -select_streams v:0 -show_entries stream=index -of csv=p=0 -- "$input" 2>/dev/null | grep -q .; then
+    die "输入不是可识别的图片或视频: $input"
+fi
+
+dimensions=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 -- "$input" 2>/dev/null | head -1)
+width="${dimensions%x*}"
+height="${dimensions#*x}"
+[[ "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]] || die "无法读取画面尺寸"
+
+ext="${input##*.}"
+ext="${ext,,}"
+is_still=0
+case "$ext" in
+    jpg|jpeg|png|webp|bmp|tiff|tif|avif|heic|heif|jxl) is_still=1 ;;
+esac
+
+if [[ -z "$mode" ]]; then
+    require_tools fzf || exit 1
+    mode=$(
+        printf '文字水印\ttext\n图片水印\timage\n' |
+            fzf --height 25% --delimiter=$'\t' --with-nth=1 --header '选择水印类型' |
+            cut -f2
+    ) || exit 0
+fi
+
+if [[ -z "$position" ]]; then
+    if [[ "$assume_yes" -eq 1 ]]; then
+        position="bottom-right"
+    else
+        position=$(
+            printf '%s\n' \
+                $'右下\tbottom-right' $'左下\tbottom-left' $'右上\ttop-right' \
+                $'左上\ttop-left' $'上中\ttop-center' $'正中\tcenter' \
+                $'下中\tbottom-center' $'中左\tcenter-left' $'中右\tcenter-right' |
+                fzf --height 45% --delimiter=$'\t' --with-nth=1 --header '选择位置' |
+                cut -f2
+        ) || exit 0
+    fi
+fi
+position_expression "$position" "text" 0 >/dev/null || die "不支持的位置: $position"
+
+prompt_number margin "边距像素" "24" "0" "10000"
+prompt_number opacity "不透明度" "0.85" "0" "1"
+
+default_output="${input%.*}_watermarked.${input##*.}"
+case "$ext" in
+    heic|heif|jxl) default_output="${input%.*}_watermarked.png" ;;
+esac
+
+if [[ -z "$output" && "$assume_yes" -eq 0 ]]; then
+    read -r -p "输出文件 [$default_output]: " output
+fi
+output="${output:-$default_output}"
+[[ "$output" != "$input" ]] || die "输出文件不能覆盖输入文件"
+mkdir -p -- "$(dirname -- "$output")"
+
+filter=""
+filter_kind="simple"
+temp_text=""
+
+if [[ "$mode" == "text" ]]; then
+    if [[ -z "$text" && "$assume_yes" -eq 0 ]]; then
+        read -r -p "水印文字 [Watermark]: " text || true
+    fi
+    text="${text:-Watermark}"
+
+    if [[ "$assume_yes" -eq 0 ]]; then
+        if [[ -z "$font_file" ]]; then
+            font_file=$(fftools_pick_font || true)
+        fi
+        # 字符集多选仅用于字体覆盖预估，不改变水印文字本身
+        picked_text=$(fftools_pick_characters || true)
+    fi
+
+    default_font_size=$((height * 4 / 100))
+    (( default_font_size < 18 )) && default_font_size=18
+    (( default_font_size > 96 )) && default_font_size=96
+    if [[ -z "$font_size" && "$assume_yes" -eq 0 ]]; then
+        font_size=$(fftools_pick_font_size "$default_font_size" || true)
+    fi
+    prompt_number font_size "字体大小" "${font_size:-$default_font_size}" "6" "1000"
+
+    if [[ -z "$font_color" ]]; then
+        if [[ "$assume_yes" -eq 1 ]]; then
+            font_color="white"
+        else
+            color_selection=$(
+                printf '%s\n' white yellow red cyan black orange pink $'自定义\tcustom' |
+                    fzf --height 35% --delimiter=$'\t' --with-nth=1 --header '选择文字颜色'
+            ) || exit 0
+            font_color="${color_selection%%$'\t'*}"
+            if [[ "$color_selection" == *$'\tcustom' ]]; then
+                read -r -p "颜色名或 #RRGGBB: " font_color
+                font_color="${font_color:-white}"
+            fi
+        fi
+    fi
+
+    if [[ -z "$style" ]]; then
+        if [[ "$assume_yes" -eq 1 ]]; then
+            style="border"
+        else
+            style=$(
+                printf '%s\n' $'描边\tborder' $'半透明底框\tbox' $'阴影\tshadow' $'无背景\tnone' |
+                    fzf --height 30% --delimiter=$'\t' --with-nth=1 --header '选择文字样式' |
+                    cut -f2
+            ) || exit 0
+        fi
+    fi
+    case "$style" in none|box|shadow|border) ;; *) die "不支持的文字样式: $style" ;; esac
+
+    if [[ -n "$font_file" ]]; then
+        [[ -f "$font_file" ]] || die "字体文件不存在: $font_file"
+    elif command -v fc-match >/dev/null 2>&1; then
+        font_file=$(fc-match -f '%{file}\n' 'Noto Sans CJK SC' 2>/dev/null | head -1)
+    fi
+
+    fftools_font_summary "${picked_text:-$text}" "$font_file" "$font_size"
+
+    temp_text=$(mktemp /tmp/fzf-watermark-text.XXXXXX)
+    trap 'rm -f -- "${temp_text:-}"' EXIT
+    printf '%s' "$text" > "$temp_text"
+
+    IFS='|' read -r pos_x pos_y <<< "$(position_expression "$position" text "$margin")"
+    escaped_textfile=$(filter_escape "$temp_text")
+    filter="drawtext=textfile='${escaped_textfile}':fontsize=${font_size}:fontcolor=${font_color}@${opacity}:x=${pos_x}:y=${pos_y}"
+    if [[ -n "$font_file" ]]; then
+        escaped_font=$(filter_escape "$font_file")
+        filter+=":fontfile='${escaped_font}'"
+    fi
+    case "$style" in
+        box)    filter+=":box=1:boxcolor=black@0.45:boxborderw=10" ;;
+        shadow) filter+=":shadowcolor=black@0.65:shadowx=3:shadowy=3" ;;
+        border) filter+=":borderw=2:bordercolor=black@0.75" ;;
+    esac
+elif [[ "$mode" == "image" ]]; then
+    if [[ -z "$logo" ]]; then
+        if [[ "$assume_yes" -eq 1 ]]; then
+            die "--logo 模式需要指定水印图片"
+        fi
+        logo=$(pick_image) || exit 0
+    fi
+    [[ -f "$logo" ]] || die "水印图片不存在: $logo"
+    prompt_number scale_percent "水印宽度占画面百分比" "15" "1" "100"
+
+    target_width=$(awk -v width="$width" -v percent="$scale_percent" \
+        'BEGIN { result = int(width * percent / 100 + 0.5); if (result < 1) result = 1; print result }')
+    IFS='|' read -r pos_x pos_y <<< "$(position_expression "$position" image "$margin")"
+    filter="[1:v]scale=${target_width}:-1:flags=lanczos,format=rgba,colorchannelmixer=aa=${opacity}[wm];[0:v][wm]overlay=${pos_x}:${pos_y}:format=auto[v]"
+    filter_kind="complex"
+else
+    die "未知水印类型: $mode"
+fi
+
+ffmpeg_bin=$(type -P ffmpeg)
+cmd=("$ffmpeg_bin" -hide_banner -i "$input")
+[[ "$mode" == "image" ]] && cmd+=(-i "$logo")
+
+if [[ "$filter_kind" == "simple" ]]; then
+    cmd+=(-vf "$filter" -map 0:v:0)
+else
+    cmd+=(-filter_complex "$filter" -map '[v]')
+fi
+cmd+=(-map_metadata 0)
+
+if [[ "$is_still" -eq 1 ]]; then
+    cmd+=(-frames:v 1 -update 1)
+    output_ext="${output##*.}"
+    output_ext="${output_ext,,}"
+    case "$output_ext" in
+        jpg|jpeg) cmd+=(-q:v 2) ;;
+        png)      cmd+=(-c:v png) ;;
+        webp)     cmd+=(-c:v libwebp -quality 92) ;;
+        avif)     cmd+=(-c:v libaom-av1 -crf 18 -b:v 0 -still-picture 1) ;;
+    esac
+else
+    output_ext="${output##*.}"
+    output_ext="${output_ext,,}"
+    case "$output_ext" in
+        webm)
+            cmd+=(-map '0:a?' -c:v libvpx-vp9 -crf 24 -b:v 0 -c:a copy)
+            ;;
+        gif)
+            cmd+=(-an -loop 0)
+            ;;
+        apng)
+            cmd+=(-an -c:v apng -plays 0)
+            ;;
+        *)
+            cmd+=(-map '0:a?' -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p -c:a copy)
+            case "$output_ext" in mp4|mov|m4v) cmd+=(-movflags +faststart) ;; esac
+            ;;
+    esac
+fi
+
+cmd+=(-y "$output")
+print_command "${cmd[@]}"
+
+if [[ "$assume_yes" -eq 0 ]]; then
+    read -r -p "执行？[Y/n] " choice
+    [[ "$choice" != n* && "$choice" != N* ]] || exit 0
+fi
+
+if "${cmd[@]}"; then
+    printf '\n完成: %s\n' "$output"
+else
+    die "FFmpeg 处理失败"
+fi
+
+if [[ "$preview_result" -eq 1 && -x "$PVID" ]]; then
+    printf '\n'
+    FZF_PREVIEW_COLUMNS="${COLUMNS:-80}" FZF_PREVIEW_LINES=28 "$PVID" "$output"
+fi

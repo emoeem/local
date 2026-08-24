@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# 电池电量监控提醒 — 低电量/满电通知
+# 运行方式：battery-monitor &  或加到 niri 自启动
+# 选项：--low N   低电提醒阈值（默认 20）
+#       --high N  满电提醒阈值（默认 95）
+# 位置参数：电池 sysfs 路径（默认自动检测 BAT0/1/2）
+
+LOW_THRESHOLD=${LOW_THRESHOLD:-20}
+HIGH_THRESHOLD=${HIGH_THRESHOLD:-95}
+NOTIFIED_LOW="/tmp/battery-low-notified"
+NOTIFIED_FULL="/tmp/battery-full-notified"
+
+command -v notify-send >/dev/null 2>&1 || { echo "缺少依赖: notify-send" >&2; exit 1; }
+
+# 解析参数: --low N / --high N / [电池路径]
+BAT_PATH=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --low|--high)
+            if [[ $# -lt 2 || ! "$2" =~ ^[0-9]+$ ]]; then
+                echo "用法: battery-monitor [--low N] [--high N] [电池路径]" >&2
+                exit 1
+            fi
+            if [[ "$1" == --low ]]; then LOW_THRESHOLD="$2"; else HIGH_THRESHOLD="$2"; fi
+            shift 2
+            ;;
+        -*)
+            echo "未知选项: $1" >&2
+            exit 1
+            ;;
+        *)
+            BAT_PATH="$1"
+            shift
+            ;;
+    esac
+done
+
+# 自动检测电池路径
+if [[ -z "$BAT_PATH" ]]; then
+    for b in /sys/class/power_supply/BAT{0,1,2}; do
+        if [[ -f "$b/capacity" ]]; then
+            BAT_PATH="$b"
+            break
+        fi
+    done
+fi
+
+if [[ -z "$BAT_PATH" ]]; then
+    echo "未找到电池设备，退出。"
+    exit 1
+fi
+
+echo "电池监控已启动: $BAT_PATH (低电≤${LOW_THRESHOLD}% / 高电≥${HIGH_THRESHOLD}%)"
+
+# sleep 放在循环顶部：sysfs 读取失败时 continue 不会跳过休眠，
+# 否则电池节点暂时不可读(休眠唤醒/驱动重载)会变成 100% CPU 空转
+while true; do
+    sleep 30
+
+    capacity=$(cat "$BAT_PATH/capacity" 2>/dev/null) || continue
+    status=$(cat "$BAT_PATH/status" 2>/dev/null) || continue
+    [[ "$capacity" =~ ^[0-9]+$ ]] || continue
+
+    # 低电量提醒（≤阈值 且正在放电）
+    if [[ "$capacity" -le "$LOW_THRESHOLD" ]] && [[ "$status" == "Discharging" || "$status" == "Unknown" ]]; then
+        if [[ ! -f "$NOTIFIED_LOW" ]]; then
+            notify-send -u critical "⚠️ 电池电量过低" "当前电量: ${capacity}%\n请尽快充电！"
+            touch "$NOTIFIED_LOW"
+            rm -f -- "$NOTIFIED_FULL"
+        fi
+    # 高电提醒（≥阈值 且正在充电或已充满）
+    elif [[ "$capacity" -ge "$HIGH_THRESHOLD" ]] && [[ "$status" == "Charging" || "$status" == "Full" ]]; then
+        if [[ ! -f "$NOTIFIED_FULL" ]]; then
+            notify-send -u normal "✅ 电池已充满" "电量: ${capacity}%\n可以拔掉电源了"
+            touch "$NOTIFIED_FULL"
+            rm -f -- "$NOTIFIED_LOW"
+        fi
+    else
+        # 恢复状态，允许下次再提醒
+        rm -f -- "$NOTIFIED_LOW" "$NOTIFIED_FULL"
+    fi
+done

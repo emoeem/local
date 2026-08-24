@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+# fzf-pkg: Arch/AUR package manager with previews and maintenance actions.
+# fzf-pkg:summary=Arch/AUR package manager TUI with updates, orphans, cache and news.
+# fzf-pkg:requires-sudo=true
+set -euo pipefail
+
+FZF_PKG_BASE=(
+    --height "${FZF_PKG_HEIGHT:-100%}"
+    --layout reverse
+    --border
+    --cycle
+    --multi
+    --delimiter $'\t'
+    --with-nth 1,2,3
+    --preview-window 'right:60%:wrap:border-left'
+    --preview-label-pos bottom
+    --bind 'ctrl-a:select-all,ctrl-x:deselect-all'
+    --bind 'ctrl-p:toggle-preview'
+    --bind 'ctrl-d:preview-half-page-down,ctrl-u:preview-half-page-up'
+    --bind 'ctrl-up:preview-up,ctrl-down:preview-down'
+    --color 'pointer:green,marker:green,header:cyan'
+)
+
+require_command() {
+    local command_name="$1"
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        printf '缺少命令: %s\n' "$command_name" >&2
+        exit 1
+    fi
+}
+
+finish_notice() {
+    if command -v omarchy-show-done >/dev/null 2>&1; then
+        omarchy-show-done
+    else
+        printf '\n完成。\n'
+    fi
+}
+
+selected_packages() {
+    cut -f2 | sed '/^[[:space:]]*$/d'
+}
+
+install_repo_packages() {
+    require_command pacman
+    local rows=()
+    mapfile -t rows < <(
+        pacman -Sl |
+            awk '{
+                status = NF >= 4 ? "[已安装]" : ""
+                printf "%s\t%s\t%s %s\n", $1, $2, $3, status
+            }' |
+            fzf "${FZF_PKG_BASE[@]}" \
+                --header '官方仓库 · Tab 多选 · Ctrl-P 切换详情' \
+                --preview-label '包信息' \
+                --preview 'pacman -Sii {2}'
+    )
+    (( ${#rows[@]} > 0 )) || return 0
+
+    local packages=()
+    local row repo package
+    for row in "${rows[@]}"; do
+        IFS=$'\t' read -r repo package _ <<< "$row"
+        packages+=("$repo/$package")
+    done
+    sudo -v
+    sudo pacman -S --needed -- "${packages[@]}"
+    finish_notice
+}
+
+install_aur_packages() {
+    require_command yay
+    local rows=()
+    mapfile -t rows < <(
+        yay -Slqa |
+            awk '{ printf "AUR\t%s\t社区构建\n", $1 }' |
+            fzf "${FZF_PKG_BASE[@]}" \
+                --header 'AUR · Tab 多选 · Ctrl-B 查看 PKGBUILD' \
+                --preview-label 'AUR 包信息' \
+                --preview 'yay -Siia {2}' \
+                --bind 'ctrl-b:change-preview:yay -Gpa {2} | tail -n +5' \
+                --bind 'ctrl-i:change-preview:yay -Siia {2}'
+    )
+    (( ${#rows[@]} > 0 )) || return 0
+
+    local packages=()
+    mapfile -t packages < <(printf '%s\n' "${rows[@]}" | selected_packages)
+    yay -S --needed -a -- "${packages[@]}"
+    finish_notice
+}
+
+remove_explicit_packages() {
+    require_command pacman
+    local rows=()
+    mapfile -t rows < <(
+        pacman -Qe |
+            awk '{ printf "已安装\t%s\t%s\n", $1, $2 }' |
+            fzf "${FZF_PKG_BASE[@]}" \
+                --header '卸载显式安装包 · Tab 多选' \
+                --preview-label '本地包信息 / 反向依赖' \
+                --preview 'pacman -Qi {2}; printf "\n反向依赖:\n"; pactree -r -d 2 {2} 2>/dev/null || true'
+    )
+    (( ${#rows[@]} > 0 )) || return 0
+
+    local packages=()
+    mapfile -t packages < <(printf '%s\n' "${rows[@]}" | selected_packages)
+    sudo -v
+    sudo pacman -Rns -- "${packages[@]}"
+    finish_notice
+}
+
+update_system() {
+    require_command yay
+    yay -Syu
+    finish_notice
+}
+
+remove_orphans() {
+    require_command pacman
+    local orphans=()
+    mapfile -t orphans < <(pacman -Qtdq 2>/dev/null || true)
+    if (( ${#orphans[@]} == 0 )); then
+        printf '没有孤儿依赖。\n'
+        return 0
+    fi
+
+    local rows=()
+    mapfile -t rows < <(
+        printf '%s\n' "${orphans[@]}" |
+            awk '{ printf "孤儿依赖\t%s\t可安全复核后删除\n", $1 }' |
+            fzf "${FZF_PKG_BASE[@]}" \
+                --header '孤儿依赖 · 默认全选，可用 Tab 取消' \
+                --bind 'start:select-all' \
+                --preview-label '包信息' \
+                --preview 'pacman -Qi {2}'
+    )
+    (( ${#rows[@]} > 0 )) || return 0
+
+    local packages=()
+    mapfile -t packages < <(printf '%s\n' "${rows[@]}" | selected_packages)
+    sudo -v
+    sudo pacman -Rns -- "${packages[@]}"
+    finish_notice
+}
+
+review_foreign_packages() {
+    require_command pacman
+    local rows=()
+    mapfile -t rows < <(
+        pacman -Qm |
+            awk '{ printf "外部/AUR\t%s\t%s\n", $1, $2 }' |
+            fzf "${FZF_PKG_BASE[@]}" \
+                --header '外部/AUR 包 · Enter 返回所选包名 · Ctrl-B 查看 PKGBUILD' \
+                --preview-label '本地/AUR 信息' \
+                --preview 'pacman -Qi {2}; printf "\nAUR:\n"; yay -Siia {2} 2>/dev/null || true' \
+                --bind 'ctrl-b:change-preview:yay -Gpa {2} 2>/dev/null | tail -n +5'
+    )
+    (( ${#rows[@]} > 0 )) || return 0
+    printf '\n所选外部包:\n'
+    printf '%s\n' "${rows[@]}" | selected_packages
+}
+
+clean_package_cache() {
+    require_command paccache
+    local before
+    before=$(du -sh /var/cache/pacman/pkg 2>/dev/null | cut -f1 || printf '未知')
+    local choice
+    choice=$(
+        printf '%s\n' \
+            $'保留每个包最近 2 个版本\tkeep2' \
+            $'保留每个包最近 1 个版本\tkeep1' \
+            $'删除所有未安装包的缓存\tunused' |
+            fzf --height 35% --layout reverse --border \
+                --delimiter $'\t' --with-nth 1 \
+                --header "当前 pacman 缓存: $before"
+    ) || return 0
+
+    sudo -v
+    case "${choice##*$'\t'}" in
+        keep2) sudo paccache -rk2 ;;
+        keep1) sudo paccache -rk1 ;;
+        unused) sudo paccache -ruk0 ;;
+    esac
+    local after
+    after=$(du -sh /var/cache/pacman/pkg 2>/dev/null | cut -f1 || printf '未知')
+    printf '缓存: %s -> %s\n' "$before" "$after"
+    finish_notice
+}
+
+show_arch_news() {
+    require_command yay
+    yay -Pw
+    printf '\n按 Enter 返回...'
+    read -r
+}
+
+show_statistics() {
+    require_command yay
+    yay -Ps
+    printf '\n按 Enter 返回...'
+    read -r
+}
+
+main_menu() {
+    local choice
+    choice=$(
+        printf '%s\n' \
+            $'1\t安装官方仓库包\tpacman' \
+            $'2\t安装 AUR 包\tyay' \
+            $'3\t卸载显式安装包\tpacman -Rns' \
+            $'4\t更新整个系统\tyay -Syu' \
+            $'5\t清理孤儿依赖\tpacman -Qtdq' \
+            $'6\t查看外部/AUR 包\tpacman -Qm' \
+            $'7\t清理软件包缓存\tpaccache' \
+            $'8\t查看 Arch 新闻\tyay -Pw' \
+            $'9\t查看包统计\tyay -Ps' |
+            fzf --height 55% --layout reverse --border --cycle \
+                --delimiter $'\t' --with-nth 1,2,3 \
+                --header 'Arch 包管理 · q/Esc 退出' \
+                --bind 'q:abort' \
+                --color 'pointer:green,marker:green,header:cyan'
+    ) || return 0
+
+    case "${choice%%$'\t'*}" in
+        1) install_repo_packages ;;
+        2) install_aur_packages ;;
+        3) remove_explicit_packages ;;
+        4) update_system ;;
+        5) remove_orphans ;;
+        6) review_foreign_packages ;;
+        7) clean_package_cache ;;
+        8) show_arch_news ;;
+        9) show_statistics ;;
+    esac
+}
+
+require_command fzf
+
+case "${1:-menu}" in
+    menu) main_menu ;;
+    update) update_system ;;
+    orphans) remove_orphans ;;
+    cache) clean_package_cache ;;
+    foreign) review_foreign_packages ;;
+    news) show_arch_news ;;
+    stats) show_statistics ;;
+    -h|--help)
+        printf '%s\n' \
+            '用法: fzf-pkg [menu|update|orphans|cache|foreign|news|stats]' \
+            '无参数时打开交互式包管理菜单。'
+        ;;
+    *)
+        printf '未知操作: %s\n' "$1" >&2
+        exit 2
+        ;;
+esac

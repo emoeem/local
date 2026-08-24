@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# fzf-ffmpeg-batch: 批量转码
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/fzf-fftools-lib"
+
+require_tools ffmpeg ffprobe || exit 1
+
+if (( $# > 0 )); then
+    files=("$@")
+else
+    require_tools fzf fd || exit 1
+    mapfile -t files < <(pick_files)
+fi
+(( ${#files[@]} > 0 )) || exit 0
+
+# 编码方式：硬件解码与硬件编码明确分开，避免把软件编码误标为“硬件加速”。
+encoder_options=(
+    'libx265     软件 H.265/HEVC · 10-bit · 体积小'
+    'libx264     软件 H.264/AVC · 兼容性好'
+)
+ffmpeg -hide_banner -encoders 2>/dev/null | grep -q ' h264_nvenc ' && \
+    encoder_options+=('h264_nvenc NVIDIA H.264/AVC 硬件编码 · 快速')
+ffmpeg -hide_banner -encoders 2>/dev/null | grep -q ' hevc_nvenc ' && \
+    encoder_options+=('hevc_nvenc NVIDIA H.265/HEVC 硬件编码 · 快速')
+
+encoder_choice=$(printf '%s\n' "${encoder_options[@]}" | \
+    fzf "${FZF_BASE[@]}" --height 35% --header '选择编码方式') || exit 0
+venc=${encoder_choice%% *}
+
+case "$venc" in
+    libx265)    encode_args=(-preset slow -crf 24); pix_default=yuv420p10le ;;
+    libx264)    encode_args=(-preset slow -crf 23); pix_default=yuv420p ;;
+    h264_nvenc) encode_args=(-preset p5 -cq 23);    pix_default=yuv420p ;;
+    hevc_nvenc) encode_args=(-preset p5 -cq 28);    pix_default=p010le ;;
+    *)          printf '不支持的编码器: %s\n' "$venc" >&2; exit 1 ;;
+esac
+
+decode_args=()
+hw=$(hw_accel_auto)
+if [[ -n "$hw" ]]; then
+    decode_choice=$(printf '%s\n' \
+        "hardware  使用 $hw 硬件解码" \
+        'software  使用软件解码' | \
+        fzf "${FZF_BASE[@]}" --height 25% --header '选择解码方式') || exit 0
+    [[ "$decode_choice" == hardware* ]] && decode_args=(-hwaccel "$hw")
+fi
+
+printf '输出目录 [%s/batch_out]: ' "$(pwd)"
+read -r dir || true
+[[ -z "$dir" ]] && dir="${PWD}/batch_out"
+mkdir -p -- "$dir"
+
+total=${#files[@]}
+ok=0
+fail=0
+for f in "${files[@]}"; do
+    name=$(basename -- "$f")
+    output="${dir}/${name%.*}_${venc}.mp4"
+    count=$((ok + fail + 1))
+
+    # HDR 检测：8-bit 编码器切到对应 10-bit 像素格式，避免色阶/色偏
+    pix_current=$pix_default
+    if detect_hdr "$f"; then
+        case "$venc" in
+            libx264)    pix_current=yuv420p10le ;;
+            h264_nvenc) pix_current=p010le ;;
+        esac
+        printf '⚠️  [%d/%d] %s — HDR 视频，使用 10-bit 编码 (%s)\n' "$count" "$total" "$name" "$pix_current"
+    fi
+
+    printf '[%d/%d] %s\n' "$count" "$total" "$name"
+    if ffmpeg "${decode_args[@]}" -i "$f" -c:v "$venc" "${encode_args[@]}" \
+        -pix_fmt "$pix_current" -c:a aac -b:a 128k -y "$output" 2>&1 | grep --line-buffered -E "frame=|error|Error"; then
+        ((++ok))
+    else
+        local_status=${PIPESTATUS[0]}
+        if (( local_status != 0 )); then
+            ((++fail))
+            printf '❌ %s — 转码失败\n' "$name"
+        else
+            ((++ok))
+        fi
+    fi
+done
+
+printf '完成: 成功 %d, 失败 %d → %s\n' "$ok" "$fail" "$dir"
+fftools_log "batch: ok=$ok fail=$fail dir=$dir"

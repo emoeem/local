@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# fzf-ai-subtitles: AI subtitle workspace launcher.
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/fzf-fftools-lib"
+
+action=$(printf '%s\n' \
+    "generate   从音频/视频生成字幕 (Whisper)" \
+    "translate  翻译已有字幕 (Ollama AI)" \
+| fzf "${FZF_BASE[@]}" --height 20% --header "AI 字幕") || exit 0
+
+case "$action" in
+    translate*) exec "$script_dir/fzf-translate-subs" ;;
+    *)          exec "$script_dir/fzf-generate-subs" ;;
+esac

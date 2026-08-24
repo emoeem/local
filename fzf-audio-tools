@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/fzf-fftools-lib"
+
+require_tools ffmpeg || exit 1
+
+force=false
+output_dir=.
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --force) force=true ;;
+        --output-dir)
+            [[ $# -ge 2 ]] || { printf '用法: fzf-audio-tools [--force] [--output-dir DIR] [音频文件...]\n' >&2; exit 2; }
+            output_dir="$2"; shift ;;
+        -h|--help) printf '用法: fzf-audio-tools [--force] [--output-dir DIR] [音频文件...]\n'; exit ;;
+        *) break ;;
+    esac
+    shift
+done
+
+mapfile -t inputs < <(if (( $# )); then printf '%s\n' "$@"; else media_candidates '\.(mp3|flac|wav|aac|m4a|opus|ogg|wma|ac3|aiff|ape)$' | fzf "${FZF_BASE[@]}" "${FZF_MULTI_BASE[@]}" --header '选择音频 · Ctrl-A 全选 · Ctrl-X 取消全选' --preview "$PVID {}"; fi)
+(( ${#inputs[@]} )) || exit 0
+overwrite=(-n)
+[[ "$force" == true ]] && overwrite=(-y)
+
+operation=$(printf '%s\n' 'normalize  EBU R128 双遍音量标准化' 'opus      转 Opus 128k' 'aac       转 AAC 192k' 'cover     提取封面' | fzf --height 30% --header '音频操作') || exit 0
+operation=${operation%% *}
+
+ok=0
+fail=0
+for input in "${inputs[@]}"; do
+    status=0
+    case "$operation" in
+        normalize)
+            output=$(fftools_output_path "$input" '_normalized' "${input##*.}" "$output_dir" "$force")
+            fftools_run ffmpeg "${overwrite[@]}" -i "$input" -af loudnorm=I=-16:TP=-1.5:LRA=11 -c:a aac -b:a 192k "$output" || status=$?
+            ;;
+        opus|aac)
+            extension=$([[ "$operation" == opus ]] && echo opus || echo m4a)
+            codec=$([[ "$operation" == opus ]] && echo libopus || echo aac)
+            bitrate=$([[ "$operation" == opus ]] && echo 128k || echo 192k)
+            output=$(fftools_output_path "$input" "_$operation" "$extension" "$output_dir" "$force")
+            fftools_run ffmpeg "${overwrite[@]}" -i "$input" -vn -c:a "$codec" -b:a "$bitrate" "$output" || status=$?
+            ;;
+        cover)
+            output=$(fftools_output_path "$input" '_cover' jpg "$output_dir" "$force")
+            fftools_run ffmpeg "${overwrite[@]}" -i "$input" -map 0:v:0 -frames:v 1 "$output" || status=$?
+            ;;
+    esac
+    if (( status == 0 )); then
+        ((++ok))
+    else
+        ((++fail))
+        printf '✗ 失败(%d): %s\n' "$status" "$input" >&2
+    fi
+done
+printf '完成: 成功 %d, 失败 %d\n' "$ok" "$fail"

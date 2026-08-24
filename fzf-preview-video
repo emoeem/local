@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# fzf-preview-video: media-aware fzf preview with cached thumbnails.
+set -u
+
+target="${1:-}"
+[[ -n "$target" ]] || { echo "未选择文件"; exit 0; }
+[[ -e "$target" ]] || { echo "文件不存在: $target"; exit 0; }
+
+if [[ -d "$target" ]]; then
+    printf '\033[1;36m%s/\033[0m\n\n' "${target%/}"
+    if command -v eza >/dev/null 2>&1; then
+        eza --tree --level=2 --color=always -- "$target" 2>/dev/null | head -200
+    else
+        find "$target" -maxdepth 2 -printf '%P\n' 2>/dev/null | sed '/^$/d' | head -200
+    fi
+    exit 0
+fi
+
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/fzf-media-preview"
+mkdir -p "$cache_dir" 2>/dev/null || cache_dir="/tmp/fzf-media-preview-$UID"
+mkdir -p "$cache_dir" 2>/dev/null
+
+mime=$(file --brief --mime-type -- "$target" 2>/dev/null || printf 'application/octet-stream')
+ext="${target##*.}"
+ext="${ext,,}"
+size=$(stat -c '%s' -- "$target" 2>/dev/null || printf '0')
+mtime=$(stat -c '%Y' -- "$target" 2>/dev/null || printf '0')
+absolute=$(realpath -- "$target" 2>/dev/null || printf '%s' "$target")
+cache_key=$(printf '%s\n%s\n%s\n' "$absolute" "$size" "$mtime" | sha256sum | cut -d' ' -f1)
+
+preview_cols="${FZF_PREVIEW_COLUMNS:-80}"
+preview_rows="${FZF_PREVIEW_LINES:-30}"
+[[ "$preview_cols" =~ ^[0-9]+$ ]] || preview_cols=80
+[[ "$preview_rows" =~ ^[0-9]+$ ]] || preview_rows=30
+(( preview_cols > 120 )) && preview_cols=120
+(( preview_cols < 24 )) && preview_cols=24
+image_rows=$((preview_rows - 8))
+(( image_rows > 34 )) && image_rows=34
+(( image_rows < 8 )) && image_rows=8
+
+image_protocol="${FZF_MEDIA_IMAGE_PROTOCOL:-auto}"
+if [[ "$image_protocol" == auto ]]; then
+    case "${TERM:-}:${TERM_PROGRAM:-}" in
+        xterm-kitty*:*|*:kitty*) image_protocol="kitty" ;;
+        *) image_protocol="symbols" ;;
+    esac
+fi
+
+clear_stale_graphics() {
+    [[ "$image_protocol" == kitty ]] && printf '\033_Ga=d,d=A\033\\'
+}
+
+render_image() {
+    local image="$1"
+    if command -v chafa >/dev/null 2>&1; then
+        local protocol="$image_protocol"
+        clear_stale_graphics
+
+        case "$protocol" in
+            sixel) protocol="sixels" ;;
+            symbols)
+                chafa --format symbols --colors full --color-space rgb \
+                    --symbols block+border --fill block --scale max --dither none --work 4 \
+                    --size "${preview_cols}x${image_rows}" --animate off \
+                    --relative off --polite on --margin-bottom 0 -- "$image" 2>/dev/null
+                ;;
+            sixels|kitty|iterm)
+                chafa --format "$protocol" --colors full --color-space rgb \
+                    --scale max --dither diffusion --work 5 \
+                    --size "${preview_cols}x${image_rows}" --animate off \
+                    --relative off --polite off --passthrough auto \
+                    --margin-bottom 0 -- "$image" 2>/dev/null
+                ;;
+            *)
+                printf '未知图片协议: %s\n' "$protocol" >&2
+                return 1
+                ;;
+        esac
+        printf '\033[0m'
+    elif command -v identify >/dev/null 2>&1; then
+        identify -- "$image" 2>/dev/null | head -3
+    fi
+}
+
+make_video_thumb() {
+    local thumb="$cache_dir/$cache_key.jpg"
+    local tmp="$cache_dir/$cache_key.$$.tmp.jpg"
+    if [[ ! -s "$thumb" ]]; then
+        if command -v ffmpegthumbnailer >/dev/null 2>&1; then
+            ffmpegthumbnailer -i "$target" -o "$tmp" -s 960 -q 9 -t 15 2>/dev/null || true
+        fi
+        if [[ ! -s "$tmp" ]]; then
+            local duration seek
+            duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 -- "$target" 2>/dev/null || printf '0')
+            seek=$(awk -v d="$duration" 'BEGIN {
+                if (d <= 2) print 0;
+                else if (d * 0.10 > 60) print 60;
+                else printf "%.3f", d * 0.10
+            }')
+            ffmpeg -v error -ss "$seek" -i "$target" -frames:v 1 \
+                -vf "scale='min(960,iw)':-2" -q:v 3 -y "$tmp" 2>/dev/null || true
+        fi
+        [[ -s "$tmp" ]] && mv -f -- "$tmp" "$thumb"
+        rm -f -- "$tmp"
+    fi
+    [[ -s "$thumb" ]] && render_image "$thumb"
+}
+
+make_audio_art() {
+    local cover="$cache_dir/$cache_key-cover.png"
+    local waveform="$cache_dir/$cache_key-wave.png"
+    local tmp="$cache_dir/$cache_key.$$.tmp.png"
+
+    if [[ ! -s "$cover" && ! -s "$waveform" ]]; then
+        ffmpeg -v error -i "$target" -map 0:v:0 -frames:v 1 -y "$tmp" 2>/dev/null || true
+        if [[ -s "$tmp" ]]; then
+            mv -f -- "$tmp" "$cover"
+        else
+            ffmpeg -v error -i "$target" \
+                -filter_complex "aformat=channel_layouts=mono,showwavespic=s=960x320:colors=0x5fd7ff:draw=full" \
+                -frames:v 1 -y "$tmp" 2>/dev/null || true
+            [[ -s "$tmp" ]] && mv -f -- "$tmp" "$waveform"
+        fi
+        rm -f -- "$tmp"
+    fi
+
+    if [[ -s "$cover" ]]; then
+        render_image "$cover"
+    elif [[ -s "$waveform" ]]; then
+        render_image "$waveform"
+    fi
+}
+
+print_file_details() {
+    local human modified
+    human=$(numfmt --to=iec --suffix=B "$size" 2>/dev/null || printf '%s bytes' "$size")
+    modified=$(stat -c '%y' -- "$target" 2>/dev/null | cut -d'.' -f1)
+    printf '\n\033[1;36m文件信息\033[0m\n'
+    printf '类型: %s\n大小: %s\n修改: %s\n' "$mime" "$human" "${modified:-未知}"
+
+    case "$mime" in
+        video/*|audio/*)
+            ffprobe -v error \
+                -show_entries format=format_long_name,duration,bit_rate:stream=codec_type,codec_name,width,height,channels,sample_rate \
+                -of default=noprint_wrappers=1:nokey=0 -- "$target" 2>/dev/null | head -14
+            ;;
+        image/*)
+            if command -v identify >/dev/null 2>&1; then
+                identify -format '格式: %m\n尺寸: %wx%h\n色彩: %[colorspace]\n' -- "$target" 2>/dev/null | head -6
+            fi
+            ;;
+    esac
+}
+
+clear_stale_graphics
+printf '\033[1;37m%s\033[0m\n\n' "$(basename -- "$target")"
+
+case "$mime" in
+    image/*)
+        render_image "$target"
+        print_file_details
+        ;;
+    video/*)
+        make_video_thumb
+        print_file_details
+        ;;
+    audio/*)
+        make_audio_art
+        print_file_details
+        ;;
+    text/*|application/json|application/xml|application/x-shellscript)
+        print_file_details
+        printf '\n'
+        if command -v bat >/dev/null 2>&1; then
+            bat --color=always --style=numbers,changes --line-range=:300 -- "$target" 2>/dev/null
+        else
+            sed -n '1,300p' -- "$target"
+        fi
+        ;;
+    *)
+        case "$ext" in
+            mp4|mkv|mov|avi|webm|m4v|flv|ts|mpeg|mpg|wmv|3gp)
+                make_video_thumb
+                ;;
+            mp3|flac|wav|aac|m4a|opus|ogg|wma|ac3)
+                make_audio_art
+                ;;
+        esac
+        print_file_details
+        ;;
+esac

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# fzf-validate-media:summary=Validate media file integrity with ffprobe via fzf.
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/fzf-fftools-lib"
+
+require_tools ffprobe || exit 1
+
+validate_one() {
+    local file="$1"
+    if [[ ! -f "$file" ]]; then
+        echo "❌ $file — 文件不存在"
+        return 1
+    fi
+    if ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$file" 2>/dev/null | grep -q .; then
+        local types
+        types=$(ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$file" 2>/dev/null | sort -u | tr '\n' ' ')
+        echo "✅ $file  (流: $types)"
+        return 0
+    else
+        echo "❌ $file — 无法识别"
+        return 1
+    fi
+}
+
+if [[ $# -gt 0 ]]; then
+    ok=0; fail=0
+    for f in "$@"; do
+        validate_one "$f" && ((++ok)) || ((++fail))
+    done
+    echo "有效: $ok  无效: $fail"
+    exit $(( fail > 0 ? 1 : 0 ))
+fi
+
+require_tools fzf fd || exit 1
+mapfile -t files < <(
+    media_candidates '\.(mp4|mkv|mov|avi|webm|ts|m4v|flv|mpeg|mpg|wmv|3gp|m4a|mp3|aac|opus|ogg|wav|flac|jpg|jpeg|png|webp|gif|bmp|tiff|tif|avif)$' |
+        fzf "${FZF_BASE[@]}" "${FZF_MULTI_BASE[@]}" \
+        --bind 'start:select-all' \
+        --header 'Tab 选择 · Ctrl-A 全选 · Ctrl-X 取消全部 · Enter 验证'
+)
+(( ${#files[@]} == 0 )) && exit 0
+
+ok=0; fail=0
+for f in "${files[@]}"; do
+    validate_one "$f" && ((++ok)) || ((++fail))
+done
+echo "有效: $ok  无效: $fail"
