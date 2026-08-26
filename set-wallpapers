@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# 按时间段自动切换 niri 壁纸（swaybg 桌面 + awww overview 背景）
+#
+# 用法:
+#   set-wallpapers          常驻后台，按时间段自动切换
+#   set-wallpapers --once   只应用当前时段的壁纸后退出
+#   set-wallpapers --print  打印当前时段应使用的壁纸路径
+set -euo pipefail
+
+# 目录名首尾都带空格，直接用 find 定位，避免手写路径出错
+WALLPAPER_DIR="$(find /home/emo/Pictures -maxdepth 1 -type d -iname '*catppuccin*' -print -quit 2>/dev/null)"
+if [[ -z "$WALLPAPER_DIR" ]]; then
+    echo "找不到壁纸目录 /home/emo/Pictures/ Catppuccin " >&2
+    exit 1
+fi
+
+MORNING_IMG="$WALLPAPER_DIR/tropic_island_morning.jpg"
+DAY_IMG="$WALLPAPER_DIR/tropic_island_day.jpg"
+EVENING_IMG="$WALLPAPER_DIR/tropic_island_evening.jpg"
+NIGHT_IMG="$WALLPAPER_DIR/tropic_island_night.jpg"
+
+# 时间段边界（24 小时制，起点小时）:
+#   morning: [MORNING_START, DAY_START)
+#   day:     [DAY_START, EVENING_START)
+#   evening: [EVENING_START, NIGHT_START)
+#   night:   [NIGHT_START, MORNING_START)（跨零点）
+MORNING_START=5
+DAY_START=12
+EVENING_START=17
+NIGHT_START=21
+
+CHECK_INTERVAL=60    # 检查间隔（秒）
+MODE="fill"          # stretch / fit / fill / center / tile
+COLOR="1e1e2e"       # 图片加载前的背景色（RRGGBB，Catppuccin Mocha base）
+
+CURRENT_IMG=""
+
+hour_now() {
+    date +%-H
+}
+
+wallpaper_for_hour() {
+    local hour="$1"
+    if (( hour >= NIGHT_START || hour < MORNING_START )); then
+        printf '%s\n' "$NIGHT_IMG"
+    elif (( hour < DAY_START )); then
+        printf '%s\n' "$MORNING_IMG"
+    elif (( hour < EVENING_START )); then
+        printf '%s\n' "$DAY_IMG"
+    else
+        printf '%s\n' "$EVENING_IMG"
+    fi
+}
+
+# 同步更新 overview 背景（awww），失败不影响桌面壁纸
+update_overview() {
+    local img="$1"
+    if command -v awww >/dev/null 2>&1; then
+        if ! awww img "$img" >/dev/null 2>&1; then
+            echo "awww 更新失败（overview 背景保持上一状态）" >&2
+            return 1
+        fi
+    fi
+}
+
+apply_current() {
+    local img
+    img="$(wallpaper_for_hour "$(hour_now)")"
+
+    # 壁纸没变且 swaybg 还活着时，什么都不用做
+    if [[ "$img" == "$CURRENT_IMG" ]] && pgrep -x swaybg >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [[ ! -f "$img" ]]; then
+        echo "壁纸文件不存在: $img" >&2
+        return 1
+    fi
+
+    pkill -x swaybg 2>/dev/null || true
+    /usr/bin/swaybg -i "$img" -m "$MODE" -c "$COLOR" &
+    local pid=$!
+
+    # 给 swaybg 一点时间连接 Wayland；失败则清空记录，下轮重试
+    sleep 1
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "swaybg 启动失败（当前不在 niri 会话中？）" >&2
+        CURRENT_IMG=""
+        return 1
+    fi
+
+    CURRENT_IMG="$img"
+    update_overview "$img" || true
+    echo "壁纸已切换: $img"
+}
+
+main() {
+    case "${1:-}" in
+        --print)
+            wallpaper_for_hour "$(hour_now)"
+            exit 0
+            ;;
+        --once)
+            apply_current
+            exit $?
+            ;;
+        ""|-h|--help)
+            ;;
+        *)
+            echo "未知参数: $1" >&2
+            exit 1
+            ;;
+    esac
+
+    if ! apply_current; then
+        echo "初始应用失败，继续在后台等待重试" >&2
+    fi
+
+    while true; do
+        sleep "$CHECK_INTERVAL"
+        apply_current || true
+    done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
