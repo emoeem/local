@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fzf-convert-media:summary=Smart media converter — auto-detect type and offer matching formats via fzf.
+# fzf-convert-media:summary=转换视频/音频/图片格式，自动识别类型并推荐方案。
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -86,6 +86,8 @@ image_menu() {
         '── 新一代 ──' \
         'webp-80     WebP 有损, 比JPEG小40%' \
         'avif        AVIF, 最新格式, 压缩率最高' \
+        'jxl         JPEG XL 有损, 比JPEG小一半' \
+        'jxl-ls      JPEG XL 无损' \
         | fzf "${FZF_BASE[@]}" --height 60% --header '选择目标格式 (图片)'
 }
 
@@ -130,6 +132,12 @@ read -r -p "输出 [$output]: " custom || true
 output="${custom:-$output}"
 if [[ "$(realpath -m -- "$output")" == "$(realpath -m -- "$file")" ]]; then
     output="${file%.*}.converted.${ext}"
+    # 回退名也已存在时追加序号，避免 -y 静默覆盖
+    index=1
+    while [[ -e "${file%.*}.converted-${index}.${ext}" ]]; do
+        ((++index))
+    done
+    [[ -e "$output" ]] && output="${file%.*}.converted-${index}.${ext}"
     echo "⚠️  输出与输入相同，已改为: $output"
 fi
 echo "→ $output"
@@ -142,11 +150,11 @@ case "$target" in
     mkv-hevc*)  fftools_run ffmpeg -i "$file" -c:v libx265 -preset medium -crf 23 -pix_fmt yuv420p10le -c:a aac -b:a 192k -y "$output" || status=$? ;;
     mp4*)       fftools_run ffmpeg -i "$file" -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart -y "$output" || status=$? ;;
     mkv*)       fftools_run ffmpeg -i "$file" -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a aac -b:a 192k -y "$output" || status=$? ;;
-    webm-vp9*)  fftools_run ffmpeg -i "$file" -c:v libvpx-vp9 -crf 32 -b:v 0 -c:a libopus -y "$output" || status=$? ;;
+    webm-vp9*)  fftools_run ffmpeg -i "$file" -c:v libvpx-vp9 -crf 32 -b:v 0 -cpu-used 2 -row-mt 1 -c:a libopus -y "$output" || status=$? ;;
     webm-vp8*)  fftools_run ffmpeg -i "$file" -c:v libvpx -crf 10 -b:v 1M -c:a libvorbis -y "$output" || status=$? ;;
     mov*)       fftools_run ffmpeg -i "$file" -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a aac -y "$output" || status=$? ;;
     m4v*)       fftools_run ffmpeg -i "$file" -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a aac -y "$output" || status=$? ;;
-    avif*)      fftools_run ffmpeg -i "$file" -c:v libaom-av1 -still-picture 1 -y "$output" || status=$? ;;
+    avif*)      fftools_run ffmpeg -i "$file" -c:v libaom-av1 -still-picture 1 -row-mt 1 -y "$output" || status=$? ;;
     avi*)       fftools_run ffmpeg -i "$file" -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a aac -y "$output" || status=$? ;;
     flv*)       fftools_run ffmpeg -i "$file" -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a aac -y "$output" || status=$? ;;
     ts*)        fftools_run ffmpeg -i "$file" -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a aac -y "$output" || status=$? ;;
@@ -177,6 +185,8 @@ case "$target" in
     png*)      fftools_run ffmpeg -i "$file" -y "$output" || status=$? ;;
     webp-80*)  fftools_run ffmpeg -i "$file" -c:v libwebp -quality 80 -y "$output" || status=$? ;;
     webp-ll*)  fftools_run ffmpeg -i "$file" -c:v libwebp -lossless 1 -y "$output" || status=$? ;;
+    jxl*)      fftools_run ffmpeg -i "$file" -c:v libjxl -distance 1 -effort 7 -y "$output" || status=$? ;;
+    jxl-ls*)   fftools_run ffmpeg -i "$file" -c:v libjxl -lossless 1 -effort 7 -y "$output" || status=$? ;;
     tiff*)     fftools_run ffmpeg -i "$file" -y "$output" || status=$? ;;
     bmp*)      fftools_run ffmpeg -i "$file" -y "$output" || status=$? ;;
     *)         echo "❌ 不支持的格式: $target"; exit 1 ;;

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # fzf-pkg: Arch/AUR package manager with previews and maintenance actions.
-# fzf-pkg:summary=Arch/AUR package manager TUI with updates, orphans, cache and news.
+# fzf-pkg:summary=Arch 软件包管理器：更新、清理、缓存、新闻。
 # fzf-pkg:requires-sudo=true
 set -euo pipefail
 
@@ -85,6 +85,7 @@ install_aur_packages() {
 
     local packages=()
     mapfile -t packages < <(printf '%s\n' "${rows[@]}" | selected_packages)
+    sudo -v
     yay -S --needed -a -- "${packages[@]}"
     finish_notice
 }
@@ -191,14 +192,14 @@ show_arch_news() {
     require_command yay
     yay -Pw
     printf '\n按 Enter 返回...'
-    read -r
+    read -r || true
 }
 
 show_statistics() {
     require_command yay
     yay -Ps
     printf '\n按 Enter 返回...'
-    read -r
+    read -r || true
 }
 
 main_menu() {

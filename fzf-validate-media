@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fzf-validate-media:summary=Validate media file integrity with ffprobe via fzf.
+# fzf-validate-media:summary=检查视频/音频/图片能不能正常读取（验尸）。
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fzf-ffmpeg-builder: 命令构建器 — 编码器+滤镜+硬件加速
+# fzf-ffmpeg-builder:summary=手动拼 ffmpeg 命令：选编码器、加滤镜、开硬件加速。
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -10,6 +10,7 @@ if [[ -z "$input" ]]; then
     require_tools fzf fd || exit 1
     input=$(pick_video) || exit 0
 fi
+[[ -f "$input" ]] || { echo "文件不存在: $input" >&2; exit 1; }
 base="${input%.*}"
 
 echo "── 视频滤镜（可选，回车跳过）──"
@@ -48,6 +49,102 @@ vf=""
 [[ -n "$crop"  ]] && vf="${vf:+$vf,}crop=$crop"
 [[ -n "$scale" ]] && vf="${vf:+$vf,}scale=$scale"
 [[ -n "$fps"   ]] && vf="${vf:+$vf,}fps=$fps"
+
+# ── 增强滤镜（可选，源自 3FUI 滤镜系统）───────────────
+denoise=$(printf '%s\n' '不降噪' 'hqdn3d 轻' 'hqdn3d 中' 'hqdn3d 强' 'nlmeans 中' 'atadenoise 中' 'bm3d 中' \
+    | fzf "${FZF_BASE[@]}" --height 35% --header '降噪（回车=不降噪）') || exit 0
+if [[ "$denoise" != 不* ]]; then
+    vf="${vf:+$vf,}$(fftools_denoise "${denoise%% *}" "${denoise##* }")"
+fi
+
+sharpen=$(printf '%s\n' '不锐化' 'unsharp 轻' 'unsharp 中' 'unsharp 强' 'cas 中' \
+    | fzf "${FZF_BASE[@]}" --height 30% --header '锐化（回车=不锐化）') || exit 0
+if [[ "$sharpen" != 不* ]]; then
+    vf="${vf:+$vf,}$(fftools_sharpen "${sharpen%% *}" "${sharpen##* }")"
+fi
+
+interp=$(printf '%s\n' '不补帧' '60fps' '120fps' \
+    | fzf "${FZF_BASE[@]}" --height 25% --header '智能补帧（mci，回车=不补帧）') || exit 0
+case "$interp" in
+    60fps|120fps) vf="${vf:+$vf,}$(fftools_interpolate "${interp%fps}")" ;;
+esac
+
+tmix=$(printf '%s\n' '不要动态模糊' '2帧' '3帧' '4帧' \
+    | fzf "${FZF_BASE[@]}" --height 25% --header '动态模糊（回车=不要）') || exit 0
+case "$tmix" in
+    *帧) vf="${vf:+$vf,}$(fftools_tmix "${tmix%帧}")" ;;
+esac
+
+grain=$(printf '%s\n' '不要颗粒' '轻' '中' '强' \
+    | fzf "${FZF_BASE[@]}" --height 25% --header '胶片颗粒（回车=不要）') || exit 0
+if [[ "$grain" != 不要* ]]; then
+    vf="${vf:+$vf,}$(fftools_grain "$grain")"
+fi
+
+# ── 平滑断层/去色带（可选，源自 3FUI）─────────────────
+deband=$(printf '%s\n' '不去断层' '轻' '中' '强' 'gradfun (快速)' \
+    | fzf "${FZF_BASE[@]}" --height 30% --header '平滑断层/去色带（回车=不去）') || exit 0
+if [[ "$deband" != 不* ]]; then
+    vf="${vf:+$vf,}$(fftools_deband "${deband%% *}")"
+fi
+
+# ── 去隔行/反胶卷下拉（可选）──────────────────────────
+deint=$(printf '%s\n' '跳过' 'yadif (隔行扫描通用)' 'yadif 倍帧' 'bwdif (质量更好)' 'IVTC 反胶卷下拉' \
+    | fzf "${FZF_BASE[@]}" --height 35% --header '去隔行（回车=跳过）') || exit 0
+case "$deint" in
+    yadif\ *)        vf="${vf:+$vf,}$(fftools_deinterlace yadif)" ;;
+    yadif\ 倍帧)     vf="${vf:+$vf,}$(fftools_deinterlace yadif_field)" ;;
+    bwdif*)          vf="${vf:+$vf,}$(fftools_deinterlace bwdif)" ;;
+    IVTC*)           vf="${vf:+$vf,}$(fftools_deinterlace ivtc)" ;;
+esac
+
+# ── 画面翻转/旋转（可选）──────────────────────────────
+flip=$(printf '%s\n' '不翻转' '顺时针旋转90°' '逆时针旋转90°' '旋转180°' '水平镜像' '垂直翻转' \
+    | fzf "${FZF_BASE[@]}" --height 35% --header '画面翻转（回车=不翻转）') || exit 0
+case "$flip" in
+    顺时针*) vf="${vf:+$vf,}$(fftools_transpose 顺时针)" ;;
+    逆时针*) vf="${vf:+$vf,}$(fftools_transpose 逆时针)" ;;
+    旋转180*) vf="${vf:+$vf,}$(fftools_transpose 180)" ;;
+    水平*)   vf="${vf:+$vf,}$(fftools_transpose 水平)" ;;
+    垂直*)   vf="${vf:+$vf,}$(fftools_transpose 垂直)" ;;
+esac
+
+# ── 抽帧：去掉重复帧（可选）──────────────────────────
+mpd=$(printf '%s\n' '不去重' '标准去重' '激进去重 (动画/录屏)' \
+    | fzf "${FZF_BASE[@]}" --height 30% --header '抽帧去重（回车=不去）') || exit 0
+case "$mpd" in
+    标准*)  vf="${vf:+$vf,}$(fftools_mpdecimate 轻)" ;;
+    激进*)  vf="${vf:+$vf,}$(fftools_mpdecimate 强)" ;;
+esac
+
+# ── 调色（可选）───────────────────────────────────────
+echo "── 调色（全部留空=不调色）──"
+echo -n "亮度 [-1~1, 如 0.06]: "; read -r eq_b || true
+echo -n "对比度 [-1000~1000, 如 0.1]: "; read -r eq_c || true
+echo -n "饱和度 [0~3, 如 1.1]: "; read -r eq_s || true
+echo -n "Gamma [0.1~10, 如 1.0]: "; read -r eq_g || true
+eq_filter=$(fftools_eq "${eq_b:-}:${eq_c:-}:${eq_s:-}:${eq_g:-}")
+[[ -n "$eq_filter" ]] && vf="${vf:+$vf,}$eq_filter"
+
+# ── 超分/高质量缩放（libplacebo，可选）────────────────
+sr=$(printf '%s\n' '不超分' '2x 超分 (ewa_lanczossharp)' '指定尺寸' \
+    | fzf "${FZF_BASE[@]}" --height 30% --header '超分 libplacebo（回车=不超分）') || exit 0
+case "$sr" in
+    2x*)   vf="${vf:+$vf,}$(fftools_superres 'iw*2:ih*2' ewa_lanczossharp)" ;;
+    指定*) echo -n "目标尺寸 W:H (如 3840:2160): "; read -r sr_wh || true
+           if [[ "$sr_wh" =~ ^[0-9]+:[0-9]+$ ]]; then
+               vf="${vf:+$vf,}$(fftools_superres "$sr_wh")"
+           else
+               printf '⚠️ 尺寸无效，已跳过超分\n' >&2
+           fi ;;
+esac
+
+# ── 高级编码选项（tune/无损，源自 3FUI 编码器数据库）──
+advanced_args=()
+if [[ "$venc" != copy && "$venc" != -vn && -n "$venc" ]]; then
+    mapfile -t advanced_args < <(fftools_advanced_args "$venc") || true
+fi
+
 echo -n "输出 [$base.mp4]: "; read -r out || true; [[ -z "$out" ]] && out="${base}.mp4"
 
 # 用数组构建命令（避免字符串拼接中的引号问题）
@@ -66,6 +163,7 @@ case "$venc" in
         [[ -n "$quality" ]] && cmd+=($qflag "$quality")
         local_pix=$(pix_fmt "$venc")
         [[ -n "$local_pix" ]] && cmd+=($local_pix)
+        (( ${#advanced_args[@]} > 0 )) && cmd+=("${advanced_args[@]}")
         ;;
 esac
 

@@ -1,31 +1,120 @@
-#!/bin/bash
-# fzf-ffmpeg-preset: 快速预设 — 源自 FFmpegFreeUI 内置方案
+#!/usr/bin/env bash
+# fzf-ffmpeg-preset:summary=用现成方案快速转码：选一个预设，指定视频，自动出结果。
+set -euo pipefail
+
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$script_dir/fzf-fftools-lib"
 
-PRESETS=(
-    "RTX50_AV1_标准  RTX50 NVENC AV1 常规 | -preset p7 -cq 36"
-    "RTX50_AV1_UHQ  NVENC AV1 UHQ 最佳平衡 | -preset p7 -tune uhq -cq 38"
-    "RTX50_HEVC_UHQ NVENC HEVC 满分答案   | -preset p7 -tune uhq -cq 28"
-    "x265_推荐      x265 slow+crf24 通用  | x265 软件"
-    "x264_推荐      x264 slower+crf23    | x264 软件"
-    "AVIF_图片      AOM AV1 压图         | 图片输出"
-)
-sel=$(printf '%s\n' "${PRESETS[@]}" | fzf "${FZF_BASE[@]}" --header '快速预设' \
-    --preview 'echo "{2}"' --preview-window 'bottom:1' | awk '{print $1}') || exit
+require_tools ffmpeg fzf fd || exit 1
+
+PRESET_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fzf-fftools/presets"
+mkdir -p -- "$PRESET_DIR"
+
+declare -A PRESET_ARGS PRESET_PASSES PRESET_EXT PRESET_DECODE
+menu=()
+
+add_preset() {
+    local name="$1" desc="$2" args="$3" passes="${4:-1}" ext="${5:-mp4}" decode="${6:-}"
+    if [[ -n "${PRESET_ARGS[$name]+x}" ]]; then
+        printf '跳过重复预设: %s\n' "$name" >&2
+        return
+    fi
+    PRESET_ARGS["$name"]="$args"
+    PRESET_PASSES["$name"]="$passes"
+    PRESET_EXT["$name"]="$ext"
+    PRESET_DECODE["$name"]="$decode"
+    menu+=("$(printf '%s\t%s\t%s' "$name" "$desc" "$passes")")
+}
+
+# ── 内置配方（参数源自 3FUI 开发者内置预设）──────────
+add_preset "AV1 高压缩（N卡）"   "3FUI 官方 RTX50 AV1 常规答案" \
+    "-c:v av1_nvenc -preset p7 -cq 36 -pix_fmt p010le" 1 mp4 "-hwaccel cuda"
+add_preset "AV1 UHQ 超压（N卡）" "极细微画质损失换大体积下降" \
+    "-c:v av1_nvenc -preset p7 -tune uhq -cq 38 -multipass fullres -rc-lookahead 240 -spatial-aq 1 -temporal-aq 1 -aq-strength 15 -tf_level -1 -pix_fmt p010le" 1 mp4 "-hwaccel cuda"
+add_preset "AV1 层次化B帧（新驱动）" "FFmpeg 9.0 + 驱动 610+，小屏观看体积再降 30%" \
+    "-c:v av1_nvenc -preset p7 -tune hq -cq 36 -rc-lookahead 0 -multipass disabled -bf 31 -b_ref_mode hierarchical -pix_fmt p010le" 1 mp4 "-hwaccel cuda"
+add_preset "H.265 UHQ（N卡）"   "3FUI 官方 HEVC 满分答案" \
+    "-c:v hevc_nvenc -preset p7 -tune uhq -cq 28 -pix_fmt p010le" 1 mp4 "-hwaccel cuda"
+add_preset "SVT-AV1-HDR 平衡点" "HDR 分支 libsvtav1 crf36，4K 建议 32G 内存" \
+    "-c:v libsvtav1 -preset 6 -crf 36 -svtav1-params tune=0:keyint=10s:enable-variance-boost=1:variance-boost-strength=1:film-grain=4:sharpness=1:ac-bias=1:lp=4 -pix_fmt yuv420p10le" 1 mp4
+add_preset "H.265 通用推荐"     "体积小、画质好，日常首选" \
+    "-c:v libx265 -preset slow -crf 24 -pix_fmt yuv420p10le -c:a aac -b:a 192k" 1 mp4
+add_preset "H.264 最兼容"       "老设备、播放器都能放" \
+    "-c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a aac -b:a 192k" 1 mp4
+add_preset "FDK AAC 无损感 M4A" "接近无损+小体积+元数据（需 libfdk_aac）" \
+    "-c:v copy -c:a libfdk_aac -vbr 5 -map_metadata 0" 1 m4a
+add_preset "AVIF 图片压缩"      "一张图片压成 AVIF" \
+    "-c:v libaom-av1 -cpu-used 1 -crf 18 -b:v 0 -aom-params tune=iq -still-picture 1 -row-mt 1" 1 avif
+add_preset "Windows ICO 图标"   "一张图生成 16~256 七种尺寸图标" \
+    "-filter_complex [0:v]split=7[s16][s24][s32][s48][s64][s128][s256];[s16]scale=w=16:h=16:force_original_aspect_ratio=decrease:flags=lanczos,pad=16:16:(ow-iw)/2:(oh-ih)/2:color=black@0,format=bgra[v16];[s24]scale=w=24:h=24:force_original_aspect_ratio=decrease:flags=lanczos,pad=24:24:(ow-iw)/2:(oh-ih)/2:color=black@0,format=bgra[v24];[s32]scale=w=32:h=32:force_original_aspect_ratio=decrease:flags=lanczos,pad=32:32:(ow-iw)/2:(oh-ih)/2:color=black@0,format=bgra[v32];[s48]scale=w=48:h=48:force_original_aspect_ratio=decrease:flags=lanczos,pad=48:48:(ow-iw)/2:(oh-ih)/2:color=black@0,format=bgra[v48];[s64]scale=w=64:h=64:force_original_aspect_ratio=decrease:flags=lanczos,pad=64:64:(ow-iw)/2:(oh-ih)/2:color=black@0,format=bgra[v64];[s128]scale=w=128:h=128:force_original_aspect_ratio=decrease:flags=lanczos,pad=128:128:(ow-iw)/2:(oh-ih)/2:color=black@0,format=bgra[v128];[s256]scale=w=256:h=256:force_original_aspect_ratio=decrease:flags=lanczos,pad=256:256:(ow-iw)/2:(oh-ih)/2:color=black@0,format=rgba[v256] -map [v16] -map [v24] -map [v32] -map [v48] -map [v64] -map [v128] -map [v256] -frames:v 1 -c:v:0 bmp -c:v:1 bmp -c:v:2 bmp -c:v:3 bmp -c:v:4 bmp -c:v:5 bmp -c:v:6 png -f ico" 1 ico
+add_preset "H.265 二次编码"     "固定码率、两次编码更稳" \
+    "-c:v libx265 -preset slow -b:v 5000k -c:a aac -b:a 192k" 2 mp4
+
+# 用法: fzf-ffmpeg-preset --save 查看预设文件格式说明并生成示例
+shopt -s nullglob
+user_preset_files=( "$PRESET_DIR"/*.preset )
+shopt -u nullglob
+if [[ "${1:-}" == "--save" ]]; then
+    for f in "${user_preset_files[@]}"; do printf '已有用户预设: %s\n' "$f"; done
+    printf '预设格式（key=value，每行一项）：\n  desc=描述\n  args=-c:v libx265 -crf 24 ...\n  passes=1|2\n  ext=mp4\n  decode=-hwaccel cuda（可留空）\n'
+    printf '示例文件已写入: %s\n' "$PRESET_DIR/示例.preset.example"
+    {
+        echo 'desc=我的 H.265 压制'
+        echo 'args=-c:v libx265 -preset slow -crf 24 -pix_fmt yuv420p10le -c:a aac -b:a 192k'
+        echo 'passes=1'
+        echo 'ext=mp4'
+        echo 'decode='
+    } > "$PRESET_DIR/示例.preset.example"
+    exit 0
+fi
+
+for f in "$PRESET_DIR"/*.preset; do
+    [[ -f "$f" ]] || continue
+    name=$(basename -- "$f" .preset)
+    desc=""; args=""; passes=1; ext=mp4; decode=""
+    while IFS= read -r line; do
+        case "$line" in
+            desc=*)   desc="${line#desc=}" ;;
+            args=*)   args="${line#args=}" ;;
+            passes=*) passes="${line#passes=}" ;;
+            ext=*)    ext="${line#ext=}" ;;
+            decode=*) decode="${line#decode=}" ;;
+        esac
+    done < "$f"
+    [[ -n "$args" ]] || continue
+    add_preset "$name" "$desc" "$args" "$passes" "$ext" "$decode"
+done
+
+(( ${#menu[@]} > 0 )) || { echo "没有可用预设" >&2; exit 1; }
+
+sel=$(printf '%s\n' "${menu[@]}" | fzf "${FZF_BASE[@]}" --height 60% \
+    --delimiter=$'\t' --with-nth=1,2 \
+    --preview 'echo "二次编码: {3}"' --preview-window 'down:1:wrap' \
+    --header '选择预设') || exit 0
+name="${sel%%$'\t'*}"
+args="${PRESET_ARGS[$name]}"
+passes="${PRESET_PASSES[$name]}"
+ext="${PRESET_EXT[$name]}"
+decode="${PRESET_DECODE[$name]}"
+
 input="${1:-}"
 if [[ -z "$input" ]]; then
-    input=$(pick_video) || exit
+    input=$(pick_visual) || exit 0
 fi
-base="${input%.*}"
+[[ -z "$input" ]] && exit 0
 
-case "$sel" in
-    RTX50_AV1_标准)  cmd=(ffmpeg -hwaccel cuda -i "$input" -c:v av1_nvenc -preset p7 -cq 36 -pix_fmt p010le "${base}_av1.mp4") ;;
-    RTX50_AV1_UHQ)  cmd=(ffmpeg -hwaccel cuda -i "$input" -c:v av1_nvenc -preset p7 -tune uhq -cq 38 -pix_fmt p010le "${base}_av1_uhq.mp4") ;;
-    RTX50_HEVC_UHQ) cmd=(ffmpeg -hwaccel cuda -i "$input" -c:v hevc_nvenc -preset p7 -tune uhq -cq 28 -pix_fmt p010le "${base}_hevc.mp4") ;;
-    x265_推荐)      cmd=(ffmpeg -i "$input" -c:v libx265 -preset slow -crf 24 -pix_fmt yuv420p10le "${base}_x265.mp4") ;;
-    x264_推荐)      cmd=(ffmpeg -i "$input" -c:v libx264 -preset slower -crf 23 -pix_fmt yuv420p10le "${base}_x264.mp4") ;;
-    AVIF_图片)      cmd=(ffmpeg -i "$input" -c:v libaom-av1 -cpu-used 1 -crf 18 -b:v 0 -aom-params tune=iq -still-picture 1 -row-mt 1 "${base}.avif") ;;
-esac
+slug=$(printf '%s' "$name" | tr -cd '0-9A-Za-z' | head -c 16 || true)
+[[ -n "$slug" ]] || slug=out
+default_output="${input%.*}_${slug}.${ext}"
+output=$(fftools_output_prompt "$input" "$default_output")
 
-confirm_run_cmd "${cmd[@]}"
+read -r -a arg_array <<< "$args"
+read -r -a decode_array <<< "$decode"
+if [[ "$passes" == 2 ]]; then
+    printf '二次编码将执行两遍 ffmpeg（第一遍分析、第二遍输出）\n'
+    fftools_confirm || exit 0
+    encode_2pass "$input" "$output" "${arg_array[@]}"
+else
+    cmd=(ffmpeg -hide_banner "${decode_array[@]}" -i "$input" "${arg_array[@]}" -y "$output")
+    confirm_run_cmd "${cmd[@]}"
+fi

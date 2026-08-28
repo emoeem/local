@@ -7,8 +7,9 @@
 
 LOW_THRESHOLD=${LOW_THRESHOLD:-20}
 HIGH_THRESHOLD=${HIGH_THRESHOLD:-95}
-NOTIFIED_LOW="/tmp/battery-low-notified"
-NOTIFIED_FULL="/tmp/battery-full-notified"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+NOTIFIED_LOW="$RUNTIME_DIR/battery-low-notified"
+NOTIFIED_FULL="$RUNTIME_DIR/battery-full-notified"
 
 command -v notify-send >/dev/null 2>&1 || { echo "缺少依赖: notify-send" >&2; exit 1; }
 
@@ -62,16 +63,16 @@ while true; do
     [[ "$capacity" =~ ^[0-9]+$ ]] || continue
 
     # 低电量提醒（≤阈值 且正在放电）
-    if [[ "$capacity" -le "$LOW_THRESHOLD" ]] && [[ "$status" == "Discharging" || "$status" == "Unknown" ]]; then
+    if [[ "$capacity" -le "$LOW_THRESHOLD" ]] && [[ "$status" == "Discharging" ]]; then
         if [[ ! -f "$NOTIFIED_LOW" ]]; then
-            notify-send -u critical "⚠️ 电池电量过低" "当前电量: ${capacity}%\n请尽快充电！"
+            notify-send -u critical "⚠️ 电池电量过低" $'当前电量: '${capacity}%$'\n请尽快充电！'
             touch "$NOTIFIED_LOW"
             rm -f -- "$NOTIFIED_FULL"
         fi
     # 高电提醒（≥阈值 且正在充电或已充满）
     elif [[ "$capacity" -ge "$HIGH_THRESHOLD" ]] && [[ "$status" == "Charging" || "$status" == "Full" ]]; then
         if [[ ! -f "$NOTIFIED_FULL" ]]; then
-            notify-send -u normal "✅ 电池已充满" "电量: ${capacity}%\n可以拔掉电源了"
+            notify-send -u normal "✅ 电池已充满" $'电量: '${capacity}%$'\n可以拔掉电源了'
             touch "$NOTIFIED_FULL"
             rm -f -- "$NOTIFIED_LOW"
         fi

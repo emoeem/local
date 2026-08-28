@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# fzf-ffmpeg-queue:summary=编码队列：一次排队多个视频，逐个处理，可跳过、可重试，中途退出后还能接着跑。
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/fzf-fftools-lib"
+
+require_tools ffmpeg ffprobe fzf fd || exit 1
+
+QUEUE_FILE="$FFTOOLS_STATE_DIR/queue.tsv"
+
+usage() {
+    cat <<'EOF'
+用法:
+  fzf-ffmpeg-queue [文件...]   新建队列并开始处理
+  fzf-ffmpeg-queue --resume    继续上次没跑完的队列
+  fzf-ffmpeg-queue --list      查看当前队列
+  fzf-ffmpeg-queue --clear     清空队列
+
+操作:
+  回车 = 开始当前任务   s = 跳过   q = 退出(任务保留)
+  a = 剩余全部自动处理   Ctrl+Z = 暂停(fg 恢复)
+EOF
+}
+
+# ── 任务数据（状态: pending/done/skipped/failed）──────
+declare -a Q_STATUS Q_IN Q_OUT Q_VENC Q_PIX Q_DECODE Q_ARGS
+
+save_queue() {
+    local decode pix
+    {
+        flock -x 9
+        : > "$QUEUE_FILE"
+        for (( j=0; j<${#Q_STATUS[@]}; j++ )); do
+            decode="${Q_DECODE[$j]}"; pix="${Q_PIX[$j]}"
+            # 空字段用占位符，避免 read 拆分时字段左移
+            [[ -n "$decode" ]] || decode=none
+            [[ -n "$pix" ]] || pix=none
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "${Q_STATUS[$j]}" "${Q_IN[$j]}" "${Q_OUT[$j]}" \
+                "${Q_VENC[$j]}" "$pix" "$decode" "${Q_ARGS[$j]}"
+        done
+    } 9> "$QUEUE_FILE.lock"
+}
+
+load_queue() {
+    local line status input output venc pix decode args
+    Q_STATUS=(); Q_IN=(); Q_OUT=(); Q_VENC=(); Q_PIX=(); Q_DECODE=(); Q_ARGS=()
+    [[ -f "$QUEUE_FILE" ]] || return 0
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        IFS=$'\t' read -r status input output venc pix decode args <<< "$line"
+        [[ "$decode" == none ]] && decode=""
+        [[ "$pix" == none ]] && pix=""
+        Q_STATUS+=("$status"); Q_IN+=("$input"); Q_OUT+=("$output")
+        Q_VENC+=("$venc"); Q_PIX+=("$pix"); Q_DECODE+=("$decode"); Q_ARGS+=("$args")
+    done < "$QUEUE_FILE"
+}
+
+run_task() {
+    local i="$1" venc="${Q_VENC[$i]}" pix="${Q_PIX[$i]}" decode="${Q_DECODE[$i]}"
+    local input="${Q_IN[$i]}" output="${Q_OUT[$i]}"
+    local -a dec_args=() enc_args args
+    [[ -n "$decode" ]] && dec_args=(-hwaccel "$decode")
+    read -r -a enc_args <<< "${Q_ARGS[$i]}"
+
+    # HDR 视频自动切 10-bit，避免色偏
+    if detect_hdr "$input"; then
+        case "$venc" in
+            libx264)    pix=yuv420p10le ;;
+            h264_nvenc) pix=p010le ;;
+        esac
+    fi
+
+    args=(ffmpeg "${dec_args[@]}" -i "$input" -c:v "$venc" "${enc_args[@]}")
+    [[ -n "$pix" ]] && args+=(-pix_fmt "$pix")
+    args+=(-c:a aac -b:a 128k -y "$output")
+    fftools_run_live "${args[@]}"
+}
+
+mkdir -p -- "$FFTOOLS_STATE_DIR"
+resume_mode=0
+case "${1:-}" in
+    --resume)
+        [[ -f "$QUEUE_FILE" ]] || { echo "没有保存的队列" >&2; exit 1; }
+        load_queue
+        resume_mode=1
+        ;;
+    --list)
+        if [[ ! -f "$QUEUE_FILE" ]]; then
+            echo "队列为空"
+            exit 0
+        fi
+        load_queue
+        printf '状态\t输入\t输出\n'
+        for (( i=0; i<${#Q_STATUS[@]}; i++ )); do
+            printf '%s\t%s\t%s\n' "${Q_STATUS[$i]}" "$(basename -- "${Q_IN[$i]}")" "$(basename -- "${Q_OUT[$i]}")"
+        done
+        exit 0
+        ;;
+    --clear)
+        rm -f -- "$QUEUE_FILE"
+        echo "队列已清空"
+        exit 0
+        ;;
+    -h|--help)
+        usage
+        exit 0
+        ;;
+esac
+
+# ── 新建队列 ───────────────────────────────────────────
+if (( resume_mode == 0 )); then
+    if (( $# > 0 )); then
+        mapfile -t files < <(printf '%s\n' "$@")
+    else
+        require_tools fd || exit 1
+        mapfile -t files < <(pick_files)
+    fi
+    (( ${#files[@]} > 0 )) || exit 0
+
+    venc=$(fftools_pick_encoder) || exit 0
+    [[ -n "$venc" ]] || exit 0
+    fftools_encoder_setup "$venc"
+    encode_args_str="${ENCODE_ARGS[*]}"
+    pix_value=$PIX_VALUE
+
+    hw=$(fftools_choose_hwaccel) || true
+
+    printf '输出目录 [%s/queue_out]: ' "$(pwd)"
+    read -r dir || true
+    [[ -z "$dir" ]] && dir="${PWD}/queue_out"
+    mkdir -p -- "$dir"
+
+    Q_STATUS=(); Q_IN=(); Q_OUT=(); Q_VENC=(); Q_PIX=(); Q_DECODE=(); Q_ARGS=()
+    for f in "${files[@]}"; do
+        # 绝对路径，保证 --resume 在其他目录也能找到输入
+        [[ "$f" == /* ]] || f="$PWD/$f"
+        name=$(basename -- "$f")
+        # 输出重名时追加序号，避免 -y 静默覆盖（含不同目录同名文件）
+        out="${dir}/${name%.*}_${venc}.mp4"
+        if [[ -e "$out" ]]; then
+            index=1
+            while [[ -e "${dir}/${name%.*}_${venc}-${index}.mp4" ]]; do
+                ((++index))
+            done
+            out="${dir}/${name%.*}_${venc}-${index}.mp4"
+        fi
+        Q_IN+=("$f")
+        Q_OUT+=("$out")
+        Q_VENC+=("$venc")
+        Q_PIX+=("$pix_value")
+        Q_DECODE+=("$hw")
+        Q_ARGS+=("$encode_args_str")
+        Q_STATUS+=(pending)
+    done
+    save_queue
+fi
+
+# ── 逐个处理 ───────────────────────────────────────────
+total=${#Q_STATUS[@]}
+run_mode=ask
+for (( i=0; i<total; i++ )); do
+    status="${Q_STATUS[$i]}"
+    [[ "$status" == pending || "$status" == failed ]] || continue
+    name=$(basename -- "${Q_IN[$i]}")
+
+    if [[ "$run_mode" == ask ]]; then
+        printf '\n[%d/%d] %s → %s\n' "$((i+1))" "$total" "$name" "$(basename -- "${Q_OUT[$i]}")"
+        read -r -p '回车=开始  s=跳过  q=退出  a=剩余全部自动: ' choice || true
+        case "$choice" in
+            s|S) Q_STATUS[$i]=skipped; save_queue; continue ;;
+            q|Q) save_queue; echo '已保存队列，可稍后用 --resume 继续'; exit 0 ;;
+            a|A) run_mode=auto ;;
+        esac
+    fi
+
+    if run_task "$i"; then
+        Q_STATUS[$i]=done
+    else
+        while :; do
+            Q_STATUS[$i]=failed
+            if [[ "$run_mode" == auto ]]; then
+                break
+            fi
+            read -r -p '❌ 失败。 r=重试  s=跳过  q=退出: ' c || { save_queue; exit 0; }
+            case "$c" in
+                r|R) ;;
+                s|S) Q_STATUS[$i]=skipped; break ;;
+                q|Q) save_queue; echo '已保存队列，可稍后用 --resume 继续'; exit 0 ;;
+                *) continue ;;
+            esac
+            if run_task "$i"; then
+                Q_STATUS[$i]=done
+                break
+            fi
+        done
+    fi
+    save_queue
+done
+
+# ── 重试所有失败任务 ───────────────────────────────────
+attempts=0
+while :; do
+    failed=()
+    for (( i=0; i<total; i++ )); do
+        [[ "${Q_STATUS[$i]}" == failed ]] && failed+=("$i")
+    done
+    (( ${#failed[@]} > 0 )) || break
+    (( attempts < 3 )) || { echo '重试次数已达上限，不再重试'; break; }
+    read -r -p "还有 ${#failed[@]} 个失败任务，全部重试？[y/N] " c || true
+    [[ "$c" == [yY]* ]] || break
+    for i in "${failed[@]}"; do
+        printf '[重试] %s\n' "$(basename -- "${Q_IN[$i]}")"
+        if run_task "$i"; then
+            Q_STATUS[$i]=done
+        else
+            Q_STATUS[$i]=failed
+        fi
+        save_queue
+    done
+    ((++attempts))
+done
+
+# ── 汇总 ───────────────────────────────────────────────
+done_n=0; failed_n=0; skipped_n=0; pending_n=0
+for s in "${Q_STATUS[@]}"; do
+    case "$s" in
+        done)    ((++done_n)) ;;
+        failed)  ((++failed_n)) ;;
+        skipped) ((++skipped_n)) ;;
+        *)       ((++pending_n)) ;;
+    esac
+done
+printf '\n队列结束：成功 %d · 失败 %d · 跳过 %d · 未处理 %d\n' "$done_n" "$failed_n" "$skipped_n" "$pending_n"
+echo "队列已保存：$QUEUE_FILE（--resume 继续，--clear 清空）"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Add text or image watermarks to still images, animated images and videos.
+# fzf-add-watermark:summary=给图片/视频加文字或图片水印。
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -67,14 +67,6 @@ prompt_number() {
         value="${value:-$default}"
     done
     printf -v "$variable" '%s' "$value"
-}
-
-filter_escape() {
-    local value="$1"
-    value=${value//\\/\\\\}
-    value=${value//:/\\:}
-    value=${value//\'/\\\'}
-    printf '%s' "$value"
 }
 
 position_expression() {
@@ -258,7 +250,7 @@ case "$ext" in
 esac
 
 if [[ -z "$output" && "$assume_yes" -eq 0 ]]; then
-    read -r -p "输出文件 [$default_output]: " output
+    read -r -p "输出文件 [$default_output]: " output || exit 0
 fi
 output="${output:-$default_output}"
 [[ "$output" != "$input" ]] || die "输出文件不能覆盖输入文件"
@@ -332,10 +324,10 @@ if [[ "$mode" == "text" ]]; then
     printf '%s' "$text" > "$temp_text"
 
     IFS='|' read -r pos_x pos_y <<< "$(position_expression "$position" text "$margin")"
-    escaped_textfile=$(filter_escape "$temp_text")
+    escaped_textfile=$(escape_subtitle_path "$temp_text")
     filter="drawtext=textfile='${escaped_textfile}':fontsize=${font_size}:fontcolor=${font_color}@${opacity}:x=${pos_x}:y=${pos_y}"
     if [[ -n "$font_file" ]]; then
-        escaped_font=$(filter_escape "$font_file")
+        escaped_font=$(escape_subtitle_path "$font_file")
         filter+=":fontfile='${escaped_font}'"
     fi
     case "$style" in
@@ -388,7 +380,7 @@ else
     output_ext="${output_ext,,}"
     case "$output_ext" in
         webm)
-            cmd+=(-map '0:a?' -c:v libvpx-vp9 -crf 24 -b:v 0 -c:a copy)
+            cmd+=(-map '0:a?' -c:v libvpx-vp9 -crf 24 -b:v 0 -c:a libopus -b:a 128k)
             ;;
         gif)
             cmd+=(-an -loop 0)

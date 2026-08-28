@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fzf-extract-audio:summary=Extract audio track from video file via fzf.
+# fzf-extract-audio:summary=把视频里的声音单独抽出来，存成音频文件。
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -7,30 +7,17 @@ source "$script_dir/fzf-fftools-lib"
 
 require_tools ffmpeg || exit 1
 
-if [[ $# -gt 0 ]]; then
-    video="$1"
-else
-    require_tools fzf fd || exit 1
-    video=$(pick_video) || exit 0
-    [[ -z "$video" ]] && exit 0
-fi
+video=$(fftools_input_video "$@") || exit 0
+[[ -z "$video" ]] && exit 0
 
 fmt=$(printf 'm4a (AAC, 通用)\nmp3\nopus (高效)\nwav (无损)\nogg' \
     | fzf "${FZF_BASE[@]}" --height 30% --header '选择输出格式') || exit 0
 [[ -z "$fmt" ]] && exit 0
 fmt_key="${fmt%% *}"
 
-output="${video%.*}.${fmt_key}"
-read -r -p "输出 [$output]: " custom
-output="${custom:-$output}"
+output=$(fftools_output_prompt "$video" "${video%.*}.${fmt_key}")
 
-case "$fmt_key" in
-    m4a)  ac=(-c:a aac -b:a 192k) ;;
-    mp3)  ac=(-c:a libmp3lame -b:a 192k) ;;
-    opus) ac=(-c:a libopus -b:a 128k) ;;
-    wav)  ac=(-c:a pcm_s16le) ;;
-    ogg)  ac=(-c:a libvorbis -b:a 192k) ;;
-    *)    echo "未知格式: $fmt_key" >&2; exit 1 ;;
-esac
+ac_str=$(audio_codec_args "$fmt_key") || { echo "未知格式: $fmt_key" >&2; exit 1; }
+read -r -a ac <<< "$ac_str"
 
 fftools_run ffmpeg -i "$video" -vn "${ac[@]}" -y "$output"

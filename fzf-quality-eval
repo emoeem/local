@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# fzf-quality-eval:summary=对比“压缩后的视频”和“原视频”，给画质打分（PSNR/SSIM/VMAF/XPSNR）。
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/fzf-fftools-lib"
+
+require_tools ffmpeg ffprobe fzf fd || exit 1
+
+if (( $# >= 2 )); then
+    dist="$1"; ref="$2"
+elif (( $# == 1 )); then
+    dist="$1"
+    ref=$(pick_video) || exit 0
+    [[ -z "$ref" ]] && exit 0
+else
+    dist=$(pick_video) || exit 0
+    [[ -z "$dist" ]] && exit 0
+    ref=$(pick_video) || exit 0
+    [[ -z "$ref" ]] && exit 0
+fi
+for f in "$dist" "$ref"; do
+    [[ -f "$f" ]] || { echo "文件不存在: $f" >&2; exit 1; }
+done
+[[ "$(realpath -m -- "$dist")" != "$(realpath -m -- "$ref")" ]] || { echo "两个文件相同，无法评测" >&2; exit 1; }
+
+metric=$(printf '%s\n' \
+    'psnr  PSNR · 经典指标，数值越高越好' \
+    'ssim  SSIM · 更接近人眼，越高越好' \
+    'vmaf  VMAF · 0~100 分，最流行' \
+    'xpsnr XPSNR · 新一代指标' \
+    'all   四项全测' \
+    | fzf "${FZF_BASE[@]}" --height 35% --header '选择评测指标' | awk '{print $1}') || exit 0
+[[ -z "$metric" ]] && exit 0
+
+dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 -- "$ref" 2>/dev/null | head -1)
+rw="${dims%x*}"; rh="${dims#*x}"
+[[ "$rw" =~ ^[0-9]+$ && "$rh" =~ ^[0-9]+$ ]] || { echo "无法读取原视频尺寸" >&2; exit 1; }
+
+ddims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 -- "$dist" 2>/dev/null | head -1)
+dw="${ddims%x*}"; dh="${ddims#*x}"
+scale_part=""
+if [[ "$dw" != "$rw" || "$dh" != "$rh" ]]; then
+    scale_part="scale=${rw}:${rh}:flags=bicubic,"
+fi
+
+read -r -p "开始时间（秒，回车=从头）: " ss || true
+read -r -p "评测时长（秒，回车=全部）: " dur || true
+trim=""
+[[ -n "$ss" ]] && trim="trim=start=${ss},"
+
+metrics=()
+case "$metric" in
+    all) metrics=(psnr ssim vmaf xpsnr) ;;
+    *)   metrics=("$metric") ;;
+esac
+
+# ── VMAF 模型与 pooling（源自 3FUI 质量评测）──────────
+case " ${metrics[*]} " in
+    *" vmaf "*)
+        # 模型选择：自动发现本地 .json 模型（3FUI/系统/用户目录）
+        mapfile -t models < <(fftools_vmaf_models)
+        if (( ${#models[@]} > 0 )); then
+            model_menu=("内置默认\tffmpeg 自带 vmaf 默认模型")
+            local_path="${XDG_DATA_HOME:-$HOME/.local/share}/vmaf-models"
+            for m in "${models[@]}"; do
+                model_menu+=("$(basename -- "$m")\t$m")
+            done
+            picked=$(printf '%s\n' "${model_menu[@]}" \
+                | fzf "${FZF_BASE[@]}" --height 40% --delimiter=$'\t' --with-nth=1 \
+                    --header 'VMAF 模型（回车=内置默认）') || exit 0
+            if [[ -n "$picked" && "$picked" != 内置默认* ]]; then
+                FZF_VMAF_MODEL="${picked#*$'\t'}"
+                export FZF_VMAF_MODEL
+                printf '使用模型: %s\n' "$(basename -- "$FZF_VMAF_MODEL")"
+            fi
+        fi
+        pool=$(printf '%s\n' 'mean    帧平均（默认，标准分数）' 'harmonic_mean  调和平均（对最差帧更敏感）' 'min     最差帧（严格）' \
+            | fzf "${FZF_BASE[@]}" --height 30% --header 'VMAF pooling 方式') || exit 0
+        case "${pool%% *}" in
+            harmonic_mean|min) FZF_VMAF_POOL="${pool%% *}"; export FZF_VMAF_POOL ;;
+        esac
+        ;;
+esac
+
+run_metric() {
+    local m="$1" stats="$2" out avg=""
+    local vdist="settb=AVTB,setpts=PTS-STARTPTS"
+    local vref="settb=AVTB,setpts=PTS-STARTPTS"
+    [[ -n "$scale_part" ]] && vdist+=",${scale_part%,}"
+    vdist="${trim}${vdist},format=yuv420p10le"
+    vref="${trim}${vref},format=yuv420p10le"
+    local fdist="[0:v]${vdist}[dist];"
+    local fref="[1:v]${vref}[ref];"
+    local filter="${fdist}${fref}$(fftools_metric_filter "$m" "$(escape_subtitle_path "$stats")")"
+    local args=(ffmpeg -hide_banner -nostdin -probesize 50M -i "$dist" -i "$ref")
+    [[ -n "$dur" ]] && args+=(-t "$dur")
+    args+=(-lavfi "$filter" -f null -)
+    out=$(command "${args[@]}" 2>&1) || return 1
+    case "$m" in
+        psnr)
+            avg=$(grep -o 'average:[0-9.]*' <<< "$out" | tail -1 | cut -d: -f2)
+            [[ -z "$avg" ]] && avg=$(grep -o 'psnr_avg:[0-9.]*' "$stats" | tail -1 | cut -d: -f2)
+            ;;
+        ssim)
+            avg=$(grep -o 'All:[0-9.]*' <<< "$out" | tail -1 | cut -d: -f2)
+            [[ -z "$avg" ]] && avg=$(grep -o 'All:Average:[0-9.]*' "$stats" | tail -1 | cut -d: -f2)
+            ;;
+        xpsnr)
+            if [[ "$out" =~ XPSNR[[:space:]]+y:[[:space:]]*([0-9.]+)[[:space:]]+u:[[:space:]]*([0-9.]+)[[:space:]]+v:[[:space:]]*([0-9.]+) ]]; then
+                avg=$(awk -v y="${BASH_REMATCH[1]}" -v u="${BASH_REMATCH[2]}" -v v="${BASH_REMATCH[3]}" \
+                    'BEGIN { printf "%.4f", (4*y+u+v)/6 }')
+            else
+                local y u v
+                y=$(grep -o 'y: *[0-9.]*' "$stats" | tail -1 | grep -o '[0-9.]*$')
+                u=$(grep -o 'u: *[0-9.]*' "$stats" | tail -1 | grep -o '[0-9.]*$')
+                v=$(grep -o 'v: *[0-9.]*' "$stats" | tail -1 | grep -o '[0-9.]*$')
+                [[ -n "$y" && -n "$u" && -n "$v" ]] && avg=$(awk -v y="$y" -v u="$u" -v v="$v" 'BEGIN { printf "%.4f", (4*y+u+v)/6 }')
+            fi
+            ;;
+        vmaf)
+            if command -v python3 >/dev/null 2>&1; then
+                avg=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["pooled_metrics"]["vmaf"]["mean"])' "$stats" 2>/dev/null) || avg=""
+            fi
+            [[ -z "$avg" ]] && avg=$(grep -o '"mean": *[0-9.]*' "$stats" | tail -1 | grep -o '[0-9.]*$')
+            ;;
+    esac
+    [[ -n "$avg" ]] || return 1
+    printf '%s' "$avg"
+}
+
+printf '\n开始评测…\n'
+results=()
+for m in "${metrics[@]}"; do
+    stats=$(mktemp "${TMPDIR:-/tmp}/fzf-metric.XXXXXX")
+    printf '  %-5s ' "$m"
+    if avg=$(run_metric "$m" "$stats"); then
+        printf '%s\n' "$avg"
+        results+=("$m|$avg")
+    else
+        echo '失败'
+    fi
+    rm -f -- "$stats"
+done
+
+if (( ${#results[@]} > 0 )); then
+    printf '\n评测结果：\n'
+    for r in "${results[@]}"; do
+        IFS='|' read -r m v <<< "$r"
+        printf '  %-5s %s\n' "$m" "$v"
+    done
+fi

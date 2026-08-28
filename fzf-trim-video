@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fzf-trim-video:summary=Trim/cut video segment (lossless or re-encoded) via fzf.
+# fzf-trim-video:summary=剪掉视频的一段：快速无损或精确重编码。
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -7,22 +7,38 @@ source "$script_dir/fzf-fftools-lib"
 
 require_tools ffmpeg ffprobe || exit 1
 
-if [[ $# -gt 0 ]]; then
-    video="$1"
-else
-    require_tools fzf fd || exit 1
-    video=$(pick_video) || exit 0
-    [[ -z "$video" ]] && exit 0
-fi
+video=$(fftools_input_video "$@") || exit 0
+[[ -z "$video" ]] && exit 0
 
 # 显示视频时长供参考
 duration_info=$(ffprobe -v error -show_entries format=duration -of csv=p=0 -- "$video" 2>/dev/null || echo "未知")
 printf '视频时长: %s\n' "$duration_info"
 
 printf '格式: HH:MM:SS 或 秒数\n'
-read -r -p "开始时间: " ss
-[[ -z "$ss" ]] && exit 0
-read -r -p "持续时长 (留空=到结尾): " t
+trim_mode=$(printf '%s\n' '指定开始和持续时长' '掐头去尾 (去掉开头和结尾各一段)' \
+    | fzf "${FZF_BASE[@]}" --height 25% --header '剪切方式') || exit 0
+ss=""; t=""
+if [[ "$trim_mode" == 掐头* ]]; then
+    duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 -- "$video" 2>/dev/null || true)
+    [[ "$duration" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "无法读取视频总时长" >&2; exit 1; }
+    echo -n "去掉开头 [0]: "; read -r head_cut || true
+    echo -n "去掉结尾 [0]: "; read -r tail_cut || true
+    head_cut="${head_cut:-0}"; tail_cut="${tail_cut:-0}"
+    # 纯数字按秒处理，HH:MM:SS 按时间解析
+    to_sec() { [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]] && printf '%s' "$1" || fftools_parse_time "$1"; }
+    ss=$(to_sec "$head_cut")
+    tail_sec=$(to_sec "$tail_cut")
+    t=$(awk -v d="$duration" -v h="$ss" -v tl="$tail_sec" 'BEGIN { printf "%.3f", d - h - tl }')
+    if awk -v t="$t" 'BEGIN{ exit !(t <= 0) }'; then
+        echo "去掉的时长超过视频总长度" >&2
+        exit 1
+    fi
+    printf '保留区间: %s 起, 持续 %s 秒\n' "$ss" "$t"
+else
+    read -r -p "开始时间: " ss || exit 0
+    [[ -z "$ss" ]] && exit 0
+    read -r -p "持续时长 (留空=到结尾): " t || exit 0
+fi
 
 # 选择切割模式
 mode=$(printf '快速 (无损拷贝, 关键帧对齐, 极快)\n精确 (重编码, 精确到帧, 较慢)' \
@@ -30,13 +46,7 @@ mode=$(printf '快速 (无损拷贝, 关键帧对齐, 极快)\n精确 (重编码
 reencode=false
 [[ "$mode" == 精* ]] && reencode=true
 
-output="${video%.*}_clip.${video##*.}"
-read -r -p "输出 [$output]: " custom || true
-output="${custom:-$output}"
-if [[ "$(realpath -m -- "$output")" == "$(realpath -m -- "$video")" ]]; then
-    output="${video%.*}_clip.${video##*.}"
-    printf '⚠️  输出与输入相同，已改为: %s\n' "$output"
-fi
+output=$(fftools_output_prompt "$video" "${video%.*}_clip.${video##*.}")
 
 if [[ "$reencode" == true ]]; then
     args=(-ss "$ss" -i "$video")

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fzf-ai-subtitles: AI subtitle workspace launcher.
+# fzf-ai-subtitles:summary=AI 字幕入口：自动生成字幕或翻译字幕。
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)

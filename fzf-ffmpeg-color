@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fzf-ffmpeg-color: 色彩管理 — HDR↔SDR、色域转换
+# fzf-ffmpeg-color:summary=色彩转换：HDR 转 SDR、SDR 转 HDR、换色域。
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)

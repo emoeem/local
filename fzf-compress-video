@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fzf-compress-video:summary=Compress/resize video with CRF, scale, audio normalization and hw accel via fzf.
+# fzf-compress-video:summary=压缩视频体积：可调画质、分辨率、音量，还能用硬件加速。
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -7,13 +7,8 @@ source "$script_dir/fzf-fftools-lib"
 
 require_tools ffmpeg ffprobe || exit 1
 
-if [[ $# -gt 0 ]]; then
-    video="$1"
-else
-    require_tools fzf fd || exit 1
-    video=$(pick_video) || exit 0
-    [[ -z "$video" ]] && exit 0
-fi
+video=$(fftools_input_video "$@") || exit 0
+[[ -z "$video" ]] && exit 0
 
 # HDR 检测
 if detect_hdr "$video"; then
@@ -29,35 +24,27 @@ case "${encoder%% *}" in
 esac
 
 # 硬件加速（解码+编码一起切到硬件；无对应编码器时保持软件编码）
-hw=$(hw_accel_auto)
+hw=$(fftools_choose_hwaccel) || true
 hw_args=()
 if [[ -n "$hw" ]]; then
-    use_hw=$(printf "使用硬件加速 ($hw)\n使用软件编码" \
-        | fzf "${FZF_BASE[@]}" --height 25% --header '硬件加速') || true
-    if [[ "$use_hw" == 使用* ]]; then
-        hw_args=(-hwaccel "$hw")
-        nvenc=""
-        case "$venc" in
-            libx264) ffmpeg -hide_banner -encoders 2>/dev/null | grep -q ' h264_nvenc ' && nvenc=h264_nvenc ;;
-            libx265) ffmpeg -hide_banner -encoders 2>/dev/null | grep -q ' hevc_nvenc ' && nvenc=hevc_nvenc ;;
-        esac
-        if [[ -n "$nvenc" ]]; then
-            venc="$nvenc"
-            if [[ "$nvenc" == hevc_nvenc ]]; then
-                pix_fmt_name="p010le"
-            else
-                pix_fmt_name="yuv420p"
-            fi
+    hw_args=(-hwaccel "$hw")
+    nvenc=$(fftools_nvenc_of "$venc" || true)
+    if [[ -n "$nvenc" ]]; then
+        venc="$nvenc"
+        if [[ "$nvenc" == hevc_nvenc || "$nvenc" == av1_nvenc ]]; then
+            pix_fmt_name="p010le"
         else
-            printf 'ℹ️ 未检测到 NVENC，硬件加速仅用于解码，编码仍为软件\n'
+            pix_fmt_name="yuv420p"
         fi
+    else
+        printf 'ℹ️ 未检测到对应硬件编码器，硬件加速仅用于解码，编码仍为软件\n'
     fi
 fi
 
 # CRF
 crf=$(printf '23 (推荐, 高质量)\n28 (中等压缩)\n32 (高压缩, 体积小)\n18 (近乎无损, 体积大)' \
     | fzf "${FZF_BASE[@]}" --height 30% --header '压缩质量 (CRF, 越小质量越高)') || exit 0
-crf_val=$(echo "$crf" | grep -oP '\d+')
+crf_val=$(fftools_first_number "$crf")
 
 # 分辨率
 scale=$(printf '保持原始\n1080p (1920x1080)\n720p (1280x720)\n480p (854x480)' \
@@ -69,19 +56,24 @@ case "${scale%% *}" in
     *)     vf_filter="" ;;
 esac
 
+# 画面增强滤镜（接入 lib 新滤镜，源自 3FUI）
+enhance=$(printf '%s\n' '不增强' '降噪 hqdn3d (中)' '去色带 deband (中)' '锐化 unsharp (中)' '2x 超分 (libplacebo)' \
+    | fzf "${FZF_BASE[@]}" --height 35% --header '画面增强') || exit 0
+enhance_vf=""
+case "$enhance" in
+    降噪*)     enhance_vf=$(fftools_denoise hqdn3d 中) ;;
+    去色带*)   enhance_vf=$(fftools_deband 中) ;;
+    锐化*)     enhance_vf=$(fftools_sharpen unsharp 中) ;;
+    2x*)       enhance_vf=$(fftools_superres 'iw*2:ih*2' ewa_lanczossharp) ;;
+esac
+
 # 音频标准化
 norm=$(printf '保持原始音频\n标准化音量 (EBU R128)' \
     | fzf "${FZF_BASE[@]}" --height 25% --header '音频处理') || exit 0
 af_args=()
 [[ "$norm" == 标准化* ]] && af_args=(-af "$(loudnorm_filter)")
 
-output="${video%.*}_compressed.mp4"
-read -r -p "输出 [$output]: " custom || true
-output="${custom:-$output}"
-if [[ "$(realpath -m -- "$output")" == "$(realpath -m -- "$video")" ]]; then
-    output="${video%.*}_compressed.mp4"
-    printf '⚠️  输出与输入相同，已改为: %s\n' "$output"
-fi
+output=$(fftools_output_prompt "$video" "${video%.*}_compressed.mp4")
 
 # 构建命令（nvenc 用 -cq，软编用 -crf）
 if [[ "$venc" == *_nvenc ]]; then
@@ -90,7 +82,10 @@ else
     qargs=(-crf "$crf_val")
 fi
 cmd_args=("${hw_args[@]}" -i "$video" -c:v "$venc" "${qargs[@]}" -preset medium -pix_fmt "$pix_fmt_name" -c:a aac -b:a 128k)
-[[ -n "$vf_filter" ]] && cmd_args+=(-vf "$vf_filter")
+# 滤镜顺序: 缩放在前、增强在后;超分时先超分再缩放反而失真,故统一 缩放→增强
+vf_chain="$vf_filter"
+[[ -n "$enhance_vf" ]] && vf_chain="${vf_chain:+$vf_chain,}$enhance_vf"
+[[ -n "$vf_chain" ]] && cmd_args+=(-vf "$vf_chain")
 cmd_args+=("${af_args[@]}")
 cmd_args+=(-y "$output")
 

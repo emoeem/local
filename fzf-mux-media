@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# fzf-mux-media:summary=把多个文件的画面、声音、字幕装进同一个容器，不重新编码（快）。
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/fzf-fftools-lib"
+
+require_tools ffmpeg ffprobe fzf fd || exit 1
+
+if (( $# > 0 )); then
+    mapfile -t inputs < <(printf '%s\n' "$@")
+else
+    require_tools fzf fd || exit 1
+    mapfile -t inputs < <(pick_files)
+fi
+(( ${#inputs[@]} > 0 )) || exit 0
+
+maps=()
+for (( i=0; i<${#inputs[@]}; i++ )); do
+    f="${inputs[$i]}"
+    streams=$(fftools_streams "$f") || { echo "无法读取: $f" >&2; exit 1; }
+    entries=()
+    v_n=0; a_n=0; s_n=0
+    while IFS='|' read -r idx codec type lang title; do
+        case "$type" in
+            video)    label="🎬 视频 #$v_n"; v_n=$((v_n+1)) ;;
+            audio)    label="🔊 音轨 #$a_n"; a_n=$((a_n+1)) ;;
+            subtitle) label="📝 字幕 #$s_n"; s_n=$((s_n+1)) ;;
+            *) continue ;;
+        esac
+        entries+=("$idx|$label|$codec|${lang:-无语言}")
+    done <<< "$streams"
+    (( ${#entries[@]} > 0 )) || { echo "跳过（没有可混流的流）: $f" >&2; continue; }
+
+    picked=$(printf '%s\n' "${entries[@]}" \
+        | fzf "${FZF_BASE[@]}" "${FZF_MULTI_BASE[@]}" --delimiter='|' --with-nth=2,3,4 \
+            --bind 'start:select-all' --header "$(basename -- "$f") · 选择要装进去的流 · Ctrl-A 全选 · Enter 确定") || exit 0
+    while IFS= read -r line; do
+        IFS='|' read -r idx label codec lang <<< "$line"
+        maps+=(-map "$i:$idx")
+    done <<< "$picked"
+done
+(( ${#maps[@]} > 0 )) || { echo "没有选择任何流" >&2; exit 1; }
+
+meta_args=()
+read -r -p "复制第 1 个文件的章节？[Y/n] " chapter_choice || true
+[[ "${chapter_choice:-y}" != [nN]* ]] && meta_args+=(-map_chapters 0)
+read -r -p "全局元数据 [1=从第1个文件复制(默认) / 0=清除 / 其他=保留原样]: " meta_mode || true
+case "${meta_mode:-1}" in
+    0) meta_args+=(-map_metadata -1) ;;
+    1) meta_args+=(-map_metadata 0) ;;
+    *) : ;;
+esac
+
+first="${inputs[0]}"
+output=$(fftools_output_prompt "$first" "${first%.*}_mux.mkv")
+
+cmd=(ffmpeg -hide_banner -nostdin)
+for f in "${inputs[@]}"; do
+    cmd+=(-i "$f")
+done
+cmd+=("${maps[@]}" "${meta_args[@]}" -c copy -y "$output")
+
+confirm_run_cmd "${cmd[@]}"

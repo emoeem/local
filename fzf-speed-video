@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fzf-speed-video:summary=Change video playback speed via fzf.
+# fzf-speed-video:summary=给视频加速或减速，声音会跟着变调。
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -7,30 +7,19 @@ source "$script_dir/fzf-fftools-lib"
 
 require_tools ffmpeg ffprobe || exit 1
 
-if [[ $# -gt 0 ]]; then
-    video="$1"
-else
-    require_tools fzf fd || exit 1
-    video=$(pick_video) || exit 0
-    [[ -z "$video" ]] && exit 0
-fi
+video=$(fftools_input_video "$@") || exit 0
+[[ -z "$video" ]] && exit 0
 
 speed=$(printf '0.5x (慢放一半)\n0.75x\n1.25x\n1.5x\n2.0x (双倍速)\n3.0x' \
     | fzf "${FZF_BASE[@]}" --height 30% --header '速度倍率') || exit 0
 [[ -z "$speed" ]] && exit 0
-factor=$(echo "$speed" | grep -oP '[\d.]+')
+factor=$(fftools_first_number "$speed")
 
-output="${video%.*}_x${factor}.mp4"
-read -r -p "输出 [$output]: " custom || true
-output="${custom:-$output}"
-if [[ "$(realpath -m -- "$output")" == "$(realpath -m -- "$video")" ]]; then
-    output="${video%.*}_x${factor}.mp4"
-    printf '⚠️  输出与输入相同，已改为: %s\n' "$output"
-fi
+output=$(fftools_output_prompt "$video" "${video%.*}_x${factor}.mp4")
 
 setpts_val=$(awk "BEGIN {printf \"%.4f\", 1/$factor}")
 
-if ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 -- "$video" 2>/dev/null | grep -q .; then
+if has_audio "$video"; then
     atempo_chain=$(build_atempo_chain "$factor")
     fftools_run ffmpeg -i "$video" \
         -filter_complex "[0:v]setpts=${setpts_val}*PTS[v];[0:a]${atempo_chain}[a]" \

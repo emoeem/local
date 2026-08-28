@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fzf-mute-video:summary=Remove audio track from video file(s) via fzf (batch).
+# fzf-mute-video:summary=去掉视频的声音（支持一次处理多个文件）。
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -7,12 +7,7 @@ source "$script_dir/fzf-fftools-lib"
 
 require_tools ffmpeg || exit 1
 
-if [[ $# -gt 0 ]]; then
-    videos=("$@")
-else
-    require_tools fzf fd || exit 1
-    mapfile -t videos < <(pick_videos)
-fi
+mapfile -t videos < <(fftools_input_videos "$@")
 (( ${#videos[@]} == 0 )) && exit 0
 
 total=${#videos[@]}
@@ -21,7 +16,7 @@ fail=0
 for v in "${videos[@]}"; do
     output="${v%.*}_muted.${v##*.}"
     printf '%s → %s ... ' "$v" "$output"
-    if ffmpeg -v error -i "$v" -c copy -an -y "$output" 2>/dev/null; then
+    if ffmpeg -v error -i "$v" -c copy -an -y "$output"; then
         ((++ok))
         echo "✅"
     else

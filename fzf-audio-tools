@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# fzf-audio-tools:summary=音频工具：音量标准化、转码、提取封面。
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -25,7 +26,7 @@ mapfile -t inputs < <(if (( $# )); then printf '%s\n' "$@"; else media_candidate
 overwrite=(-n)
 [[ "$force" == true ]] && overwrite=(-y)
 
-operation=$(printf '%s\n' 'normalize  EBU R128 双遍音量标准化' 'opus      转 Opus 128k' 'aac       转 AAC 192k' 'cover     提取封面' | fzf --height 30% --header '音频操作') || exit 0
+operation=$(printf '%s\n' 'normalize  EBU R128 双遍音量标准化' 'opus      转 Opus 128k' 'aac       转 AAC 192k' 'cover     提取封面' | fzf "${FZF_BASE[@]}" --height 30% --header '音频操作') || exit 0
 operation=${operation%% *}
 
 ok=0
@@ -34,7 +35,8 @@ for input in "${inputs[@]}"; do
     status=0
     case "$operation" in
         normalize)
-            output=$(fftools_output_path "$input" '_normalized' "${input##*.}" "$output_dir" "$force")
+            # AAC 只能放进 m4a/mp4 等容器，统一输出 m4a，避免 AAC 塞进 FLAC/OGG 等容器失败
+            output=$(fftools_output_path "$input" '_normalized' m4a "$output_dir" "$force")
             fftools_run ffmpeg "${overwrite[@]}" -i "$input" -af loudnorm=I=-16:TP=-1.5:LRA=11 -c:a aac -b:a 192k "$output" || status=$?
             ;;
         opus|aac)

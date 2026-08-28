@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fzf-burn-subs:summary=Burn/hardcode subtitles into video via fzf.
+# fzf-burn-subs:summary=把字幕烧进画面里，让所有设备都能直接看到。
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -21,13 +21,7 @@ else
     [[ -z "$subs" ]] && exit 0
 fi
 
-output="${video%.*}_subbed.mp4"
-read -r -p "输出 [$output]: " custom || true
-output="${custom:-$output}"
-if [[ "$(realpath -m -- "$output")" == "$(realpath -m -- "$video")" ]]; then
-    output="${video%.*}_subbed.mp4"
-    printf '⚠️  输出与输入相同，已改为: %s\n' "$output"
-fi
+output=$(fftools_output_prompt "$video" "${video%.*}_subbed.mp4")
 
 font_file=$(fftools_pick_font || true)
 font_size=$(fftools_pick_font_size 18 || true)
@@ -35,8 +29,9 @@ font_size=${font_size:-18}
 font_name=$(fftools_font_family "$font_file" 2>/dev/null || true)
 fonts_dir=""
 [[ -n "$font_file" ]] && fonts_dir=$(dirname -- "$font_file")
-fftools_font_summary "$(sed -E '/^[0-9]+$|^[[:space:]]*$|-->/d' "$subs" 2>/dev/null | tr -d '\n')" \
+fftools_font_summary "$(awk '/^[0-9]+$ && !ts { next } /-->/{ts=1} /^[[:space:]]*$/{ts=0} { print }' "$subs" 2>/dev/null | sed -E '/^[[:space:]]*$|-->/d' | tr -d '\n')" \
     "$font_file" "$font_size"
 subtitle_filter=$(subtitle_filter "$subs" "$font_size" "$font_name" "$fonts_dir")
+# mp4 容器对很多输入音轨（FLAC/DTS/Opus 等）不支持 copy，统一转码 AAC
 fftools_run ffmpeg -i "$video" -vf "$subtitle_filter" \
-    -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a copy -y "$output"
+    -c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p -c:a aac -b:a 192k -y "$output"

@@ -1,5 +1,5 @@
 #!/bin/bash
-# fzf-merge-av:summary=智能匹配分离的音视频文件并合并，自动跳过已完成项。
+# fzf-merge-av:summary=自动找到“视频+音频”分离的文件并合并成一个，已完成会自动跳过。
 
 set -euo pipefail
 
@@ -88,7 +88,12 @@ for stem in "${!vfile_map[@]}"; do
     validate_media "$af" "audio" || a_ok=false
 
     if ! $v_ok || ! $a_ok; then
-        invalid+=("$stem")
+        # 输出已存在的仍算已完成，避免误报"可能损坏"
+        if [[ -f "$output" ]]; then
+            done_already+=("$stem")
+        else
+            invalid+=("$stem")
+        fi
     elif [[ -f "$output" ]]; then
         done_already+=("$stem")
     else
@@ -209,17 +214,31 @@ while IFS= read -r stem; do
     echo "    ➡  $output"
     echo ""
 
+    # 先写到临时文件，成功后再改名，避免半成品输出被误判为"已完成"而永久跳过
+    tmp_output="${output}.part.mp4"
+    rm -f -- "$tmp_output"
+
     if ffmpeg -i "$video" -i "$audio" \
         -c copy -map 0:v -map 1:a \
-        -y "$output"; then
+        -y "$tmp_output" 2>/dev/null; then
+        mv -- "$tmp_output" "$output"
         echo "  ✅ 完成"
         ((++total))
     elif ffmpeg -i "$video" -i "$audio" \
         -c:v copy -c:a aac -b:a 192k -map 0:v -map 1:a \
-        -y "$output"; then
+        -y "$tmp_output" 2>/dev/null; then
+        mv -- "$tmp_output" "$output"
         echo "  ✅ 完成 (音频已转码 AAC)"
         ((++total))
+    elif ffmpeg -i "$video" -i "$audio" \
+        -c:v libx264 -crf 20 -preset medium -c:a aac -b:a 192k -map 0:v -map 1:a \
+        -pix_fmt yuv420p \
+        -y "$tmp_output" 2>/dev/null; then
+        mv -- "$tmp_output" "$output"
+        echo "  ✅ 完成 (流复制失败，已重编码)"
+        ((++total))
     else
+        rm -f -- "$tmp_output"
         echo "  ❌ 失败"
         ((++fail))
     fi

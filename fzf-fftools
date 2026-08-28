@@ -5,6 +5,8 @@ set -u
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$script_dir/fzf-fftools-lib"
 
+require_tools fzf || exit 1
+
 if [[ "${1:-}" == "--yazi" ]]; then
     shift
     require_tools yazi || exit 1
@@ -18,29 +20,33 @@ case "${1:-}" in
 esac
 
 OPS=(
-    "1. 命令构建器    fzf-ffmpeg-builder     编码器+滤镜+硬件加速"
-    "2. 快速预设      fzf-ffmpeg-preset      一键硬件/软件方案"
-    "3. 裁剪片段      fzf-trim-video         按时间裁剪"
-    "4. 提取音频      fzf-extract-audio      从视频提取音频"
-    "5. 移除音频      fzf-mute-video         删除音轨"
-    "6. 合并音视频    fzf-merge-av           mkv 封装"
-    "7. 拼接视频      fzf-concat-video       合并多片段"
-    "8. 烧录字幕      fzf-burn-subs          嵌入字幕"
-    "9. 视频转GIF     fzf-video-to-gif       生成动图"
-    "A. 变速处理      fzf-speed-video        加速/减速"
-    "B. 批量转码      fzf-ffmpeg-batch       批量处理"
-    "C. 色彩管理      fzf-ffmpeg-color       HDR/SDR/色域"
-    "D. 媒体转换      fzf-convert-media      视频/音频/图片格式"
-    "E. 媒体验证      fzf-validate-media     检查文件完整性"
-    "F. 添加水印      fzf-add-watermark      文字/图片水印"
-    "G. 媒体浏览      __browse_media         图片/视频帧/音频封面"
-    "H. Yazi工作台    __yazi_media           高清预览并用 F f 处理媒体"
-    "I. AI字幕工具    fzf-ai-subtitles       Whisper生成或直接AI翻译已有字幕"
-    "J. 字幕工具      fzf-subtitles          抽取、封装、烧录字幕"
-    "K. 音频工具      fzf-audio-tools        标准化、转码、封面"
-    "L. 媒体分析      __analyze_media        编码、HDR、音轨、字幕"
-    "M. 环境诊断      __doctor               检查依赖与编码器"
-    "N. 预览缓存      __cache                状态、清理、过期裁剪"
+    "1. 一键预设      fzf-ffmpeg-preset       选现成方案直接转码"
+    "2. 命令构建器    fzf-ffmpeg-builder      手动拼 ffmpeg 命令"
+    "3. 裁剪片段      fzf-trim-video          剪掉一段，快速或精确"
+    "4. 抽流          fzf-extract-streams     抽出视频/音轨/字幕/附件"
+    "5. 混流          fzf-mux-media           把画面声音字幕装进一个文件"
+    "6. 提取音频      fzf-extract-audio       把声音单独存出来"
+    "7. 移除音频      fzf-mute-video          去掉声音"
+    "8. 合并音视频    fzf-merge-av            自动配对视频+音频并合并"
+    "9. 拼接视频      fzf-concat-video        多个视频按顺序接成一个"
+    "A. 烧录字幕      fzf-burn-subs           把字幕印进画面"
+    "B. 视频转GIF     fzf-video-to-gif        做成动图"
+    "C. 变速处理      fzf-speed-video         加速或减速"
+    "D. 批量转码      fzf-ffmpeg-batch        一次处理多个视频"
+    "E. 色彩管理      fzf-ffmpeg-color        HDR/SDR 互转"
+    "F. 媒体转换      fzf-convert-media       换视频/音频/图片格式"
+    "G. 质量评测      fzf-quality-eval        压缩前后画质打分"
+    "H. 媒体验证      fzf-validate-media      检查文件是否损坏"
+    "I. 添加水印      fzf-add-watermark       加文字或图片水印"
+    "J. 媒体浏览      __browse_media          看图/视频帧/音频封面"
+    "K. Yazi工作台    __yazi_media            文件管理器"
+    "L. AI字幕        fzf-ai-subtitles        Whisper 生成或 AI 翻译"
+    "M. 字幕工具      fzf-subtitles           抽取、封装、烧录字幕"
+    "N. 音频工具      fzf-audio-tools         标准化音量、转码、封面"
+    "O. 媒体分析      __analyze_media         查看编码、HDR、音轨"
+    "P. 环境诊断      __doctor                检查依赖与编码器"
+    "Q. 预览缓存      __cache                 清理预览缓存"
+    "R. 编码队列      fzf-ffmpeg-queue        排队处理，可跳过、可重试"
 )
 
 while true; do

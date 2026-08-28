@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# fzf-extract-streams:summary=从视频里抽出想要的内容：视频流、音轨、字幕或附件，单独存成文件。
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/fzf-fftools-lib"
+
+require_tools ffmpeg ffprobe fzf fd || exit 1
+
+input="${1:-}"
+if [[ -z "$input" ]]; then
+    input=$(pick_media) || exit 0
+fi
+[[ -z "$input" ]] && exit 0
+[[ -f "$input" ]] || { echo "文件不存在: $input" >&2; exit 1; }
+
+streams=$(fftools_streams "$input") || { echo "无法读取文件信息: $input" >&2; exit 1; }
+[[ -n "$streams" ]] || { echo "没有找到任何流" >&2; exit 1; }
+
+entries=()
+v_n=0; a_n=0; s_n=0; t_n=0
+while IFS='|' read -r idx codec type lang title; do
+    case "$type" in
+        video)      label="🎬 视频 #$v_n"; v_n=$((v_n+1)) ;;
+        audio)      label="🔊 音轨 #$a_n"; a_n=$((a_n+1)) ;;
+        subtitle)   label="📝 字幕 #$s_n"; s_n=$((s_n+1)) ;;
+        attachment) label="📎 附件 #$t_n"; t_n=$((t_n+1)) ;;
+        *)          label="❓ 其他 #$t_n"; t_n=$((t_n+1)) ;;
+    esac
+    entries+=("$idx|$type|$label|$codec|${lang:-无语言}|${title:-无标题}")
+done <<< "$streams"
+
+selected=$(printf '%s\n' "${entries[@]}" \
+    | fzf "${FZF_BASE[@]}" "${FZF_MULTI_BASE[@]}" --delimiter='|' --with-nth=3,4,5,6 \
+        --header '选择要抽出的流 · Tab 多选 · Ctrl-A 全选 · Enter 提取') || exit 0
+[[ -z "$selected" ]] && exit 0
+
+base=$(basename -- "${input%.*}")
+dir=$(dirname -- "$input")
+v_n=0; a_n=0; s_n=0; t_n=0
+
+while IFS= read -r line; do
+    IFS='|' read -r idx type label codec lang title <<< "$line"
+    case "$type" in
+        video)      type_name="视频"; n=$v_n; v_n=$((v_n+1)) ;;
+        audio)      type_name="音轨"; n=$a_n; a_n=$((a_n+1)) ;;
+        subtitle)   type_name="字幕"; n=$s_n; s_n=$((s_n+1)) ;;
+        attachment) type_name="附件"; n=$t_n; t_n=$((t_n+1)) ;;
+        *)          type_name="其他"; n=$t_n; t_n=$((t_n+1)) ;;
+    esac
+
+    if [[ "$type" == attachment ]]; then
+        fname=$(basename -- "${title:-}" 2>/dev/null)
+        [[ -n "$fname" && "$fname" != "/" && "$fname" != "." ]] || fname="附件${n}.bin"
+        output="${dir}/${base}_附件${n}_${fname}"
+        cmd=(ffmpeg -hide_banner -nostdin -y -dump_attachment:t:"$n" "$output" -i "$input" -t 0 -f null -)
+    else
+        output="${dir}/${base}_${type_name}${n}_${codec}.$(codec_extension "$codec")"
+        codec_part=(-c copy)
+        [[ "$type" == subtitle && "$codec" == mov_text ]] && codec_part=(-c:s srt)
+        cmd=(ffmpeg -hide_banner -nostdin -i "$input" -map "0:$idx" "${codec_part[@]}" -map_metadata -1 -y "$output")
+    fi
+    confirm_run_cmd "${cmd[@]}"
+done <<< "$selected"

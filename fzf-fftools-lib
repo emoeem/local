@@ -4,6 +4,7 @@
 FZF_FFTOOLS_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PVID="$FZF_FFTOOLS_DIR/fzf-preview-video"
 [[ -x "$PVID" ]] || PVID="$(command -v fzf-preview-video 2>/dev/null || true)"
+[[ -n "$PVID" ]] || PVID=echo   # 无预览器时至少显示文件名，避免把选中文件当命令执行
 FFTOOLS_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/fzf-fftools"
 FFTOOLS_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/fzf-media-preview"
 FFTOOLS_FONT_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/fzf-fftools/fonts.tsv"
@@ -97,6 +98,61 @@ pick_files() {
         pick_multi_with_preview '选择文件 · Tab 多选 · Ctrl-A 全选'
 }
 
+# ── 输入参数或交互选择 ─────────────────────────────────
+fftools_input_video() {
+    if (( $# > 0 )); then
+        printf '%s\n' "$@"
+    else
+        require_tools fzf fd || return 1
+        pick_video
+    fi
+}
+
+fftools_input_videos() {
+    if (( $# > 0 )); then
+        printf '%s\n' "$@"
+    else
+        require_tools fzf fd || return 1
+        pick_videos
+    fi
+}
+
+# ── 输出路径确认（含同名保护）─────────────────────────
+fftools_output_prompt() {
+    local input="$1" default_output="$2" output
+    read -r -p "输出 [$default_output]: " output || true
+    output="${output:-$default_output}"
+    if [[ "$(realpath -m -- "$output")" == "$(realpath -m -- "$input")" ]]; then
+        output="$default_output"
+        # 默认输出本身也与输入相同时（如格式扩展名一致），追加序号避免覆盖源文件
+        if [[ "$(realpath -m -- "$output")" == "$(realpath -m -- "$input")" ]]; then
+            index=1
+            stem="${default_output%.*}" ext="${default_output##*.}"
+            [[ "$stem" == "$default_output" ]] && ext="" || true
+            while [[ -e "${stem}-${index}${ext:+.$ext}" ]]; do
+                ((++index))
+            done
+            output="${stem}-${index}${ext:+.$ext}"
+        fi
+        printf '⚠️  输出与输入相同，已改为: %s\n' "$output"
+    fi
+    printf '%s\n' "$output"
+}
+
+# ── 提取字符串中的第一个数字 ──────────────────────────
+fftools_first_number() {
+    printf '%s\n' "$1" | grep -oE '[0-9]+(\.[0-9]+)?' | head -n 1
+}
+
+# ── 列出媒体文件的流（ffprobe → CSV）─────────────────
+# 输出: 全局序号,编码器,类型,语言,标题
+fftools_streams() {
+    local file="$1"
+    ffprobe -v error \
+        -show_entries stream=index,codec_type,codec_name:stream_tags=language,title \
+        -of compact=p=0:nk=1 -- "$file" 2>/dev/null
+}
+
 fftools_log() {
     mkdir -p -- "$FFTOOLS_STATE_DIR"
     printf '[%(%F %T)T] %s\n' -1 "$*" >> "$FFTOOLS_STATE_DIR/tasks.log"
@@ -176,7 +232,9 @@ fftools_doctor() {
         fi
     done
     printf '\n编码器：\n'
-    for encoder in h264_nvenc hevc_nvenc av1_nvenc libx264 libx265 libsvtav1; do
+    for encoder in h264_nvenc hevc_nvenc av1_nvenc libx264 libx265 libsvtav1 \
+        libaom-av1 libvpx-vp9 libsvt_hevc h264_qsv hevc_qsv av1_qsv \
+        h264_vaapi hevc_vaapi av1_vaapi; do
         if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q " $encoder"; then
             printf '✓ %s\n' "$encoder"
         else
@@ -212,28 +270,49 @@ VENC_LIST=(
     "─── AV1 ───"  "libsvtav1        SVT-AV1 软件  | -preset 0~13(6)  | -crf 0~63(23)"
     "libaom-av1       AOM AV1 软件，极慢 | -cpu-used 0~8(5)  | -crf 0~63(30)"
     "av1_nvenc        NVIDIA NVENC 硬件    | -preset p7~p1(p7) | -cq 0~255(36)"
+    "av1_qsv          Intel QSV 硬件       | -preset veryslow~veryfast | -global_quality 1~51(26)"
+    "av1_vaapi        VA-API 硬件          | -compression_level 0~9"
+    "librav1e         rav1e 软件           | -speed 0~10(6) | -qp 0~255(60)"
     "─── H.265/HEVC ───"
     "libx265          x265 软件，最主流    | -preset veryslow~ultrafast(slow) | -crf 0~51(23)"
     "hevc_nvenc       NVIDIA NVENC 硬件    | -preset p7~p1(p7) | -cq 0~51(26)"
+    "hevc_qsv         Intel QSV 硬件       | -preset veryslow~veryfast | -global_quality 1~51(23)"
+    "hevc_vaapi       VA-API 硬件          | -compression_level 0~9"
+    "libsvt_hevc      SVT-HEVC 软件        | -preset 0~12(7) | -qp 0~51(24)"
     "─── H.264/AVC ───"
     "libx264          x264 软件，兼容最好   | -preset veryslow~ultrafast(slower) | -crf 0~51(23)"
     "h264_nvenc       NVIDIA NVENC 硬件    | -preset p7~p1(p7) | -cq 0~51(23)"
+    "h264_qsv         Intel QSV 硬件       | -preset veryslow~veryfast | -global_quality 1~51(23)"
+    "h264_vaapi       VA-API 硬件          | -compression_level 0~9"
     "─── 其他 ───"
     "libvpx-vp9       VP9 (Google) | -crf 0~63"  "prores_ks        ProRes 剪辑格式"
+    "libvvenc         H.266/VVC 下一代 | -qp -1~63(35)"  "ffv1             FFv1 归档无损"
+    "libvpx           VP8 (Google)"  "h264_vulkan      Vulkan 硬件 H.264"
+    "hevc_vulkan      Vulkan 硬件 H.265"  "av1_vulkan       Vulkan 硬件 AV1"
 )
 AENC_LIST=(
     "copy 复制音频流" "-an 禁用音频流" "aac AAC | -b:a 128k~320k"
     "opus Opus | -b:a 96k~192k" "mp3 MP3 | -b:a 128k~320k" "flac FLAC 无损"
-    "pcm_s16le WAV 无损" "libvorbis Vorbis" "ac3 AC-3"
+    "pcm_s16le WAV 无损" "libvorbis Vorbis" "ac3 AC-3" "alac ALAC 无损"
 )
 PSMAP=(
     "libsvtav1:-preset:0~13:6" "libaom-av1:-cpu-used:0~8:5"
-    "av1_nvenc:-preset:p7~p1:p7" "libx265:-preset:veryslow~ultrafast:slow"
-    "hevc_nvenc:-preset:p7~p1:p7" "libx264:-preset:veryslow~ultrafast:slower"
+    "av1_nvenc:-preset:p7~p1:p7" "av1_qsv:-preset:veryslow~veryfast:medium"
+    "librav1e:-speed:0~10:6" "libx265:-preset:veryslow~ultrafast:slow"
+    "hevc_nvenc:-preset:p7~p1:p7" "hevc_qsv:-preset:veryslow~veryfast:medium"
+    "libsvt_hevc:-preset:0~12:7" "libx264:-preset:veryslow~ultrafast:slower"
+    "h264_nvenc:-preset:p7~p1:p7" "h264_qsv:-preset:veryslow~veryfast:medium"
+    "libvpx-vp9:-cpu-used:0~8:2" "libvvenc:-preset:medium:medium"
+    "libvpx:-cpu-used:0~8:5"
 )
 QMAP=(
     "libsvtav1:-crf:0~63:23" "libaom-av1:-crf:0~63:30" "av1_nvenc:-cq:0~255:36"
-    "libx265:-crf:0~51:23" "hevc_nvenc:-cq:0~51:26" "libx264:-crf:0~51:23"
+    "av1_qsv:-global_quality:1~51:26" "librav1e:-qp:0~255:60" "libx265:-crf:0~51:23"
+    "hevc_nvenc:-cq:0~51:26" "hevc_qsv:-global_quality:1~51:23" "libsvt_hevc:-qp:0~51:24"
+    "libx264:-crf:0~51:23" "h264_nvenc:-cq:0~51:23" "h264_qsv:-global_quality:1~51:23"
+    "libvpx-vp9:-crf:0~63:31" "libvvenc:-qp:-1~63:35" "libvpx:-crf:4~63:10"
+    "ffv1:-level:1~3:3"
+    "h264_vulkan:-qp:0~51:23" "hevc_vulkan:-qp:0~51:26" "av1_vulkan:-qp:0~63:36"
 )
 
 get_preset() {
@@ -265,8 +344,13 @@ get_quality() {
 
 pix_fmt() {
     case "$1" in
+        h264_nvenc) echo "-pix_fmt yuv420p" ;;
         *nvenc) echo "-pix_fmt p010le" ;;
         libx265|libx264) echo "-pix_fmt yuv420p10le" ;;
+        libsvtav1|libaom-av1|librav1e|libsvt_hevc|libvpx-vp9|libvvenc) echo "-pix_fmt yuv420p10le" ;;
+        h264_qsv) echo "-pix_fmt nv12" ;;
+        *_qsv) echo "-pix_fmt p010le" ;;
+        *_vulkan|ffv1|libvpx) echo "" ;;
     esac
 }
 
@@ -281,6 +365,22 @@ escape_subtitle_path() {
     path="${path//\[/\\[}"      # open bracket
     path="${path//\]/\\]}"      # close bracket
     printf '%s' "$path"
+}
+
+# ── 通用滤镜路径转义（drawtext 等；引号规则与字幕不同）──
+filter_escape() {
+    local value="$1"
+    value=${value//\\/\\\\}
+    value=${value//:/\\:}
+    value=${value//\'/\\\'}
+    printf '%s' "$value"
+}
+
+# ── concat 列表文件路径转义 ────────────────────────────
+fftools_concat_escape() {
+    local path="$1"
+    path=${path//\'/\'\\\'\'}
+    printf "'%s'" "$path"
 }
 
 subtitle_filter() {
@@ -428,6 +528,7 @@ build_atempo_chain() {
     local factor="$1"
     local filters=()
     local remaining="$factor"
+    export LC_ALL=C
     while awk "BEGIN{exit !($remaining>2.0)}"; do
         filters+=("atempo=2.0")
         remaining=$(awk "BEGIN{printf \"%.4f\", $remaining/2.0}")
@@ -469,6 +570,13 @@ detect_hdr() {
     [[ "$info" == *"bt2020"* || "$info" == *"smpte2084"* ]]
 }
 
+# ── 检测文件是否含音频流 ──────────────────────────────
+has_audio() {
+    local file="$1"
+    ffprobe -v error -select_streams a -show_entries stream=index \
+        -of csv=p=0 -- "$file" 2>/dev/null | grep -q .
+}
+
 # ── 自动检测最佳硬件加速方案 ────────────────────────────
 hw_accel_auto() {
     if ffmpeg -hide_banner -hwaccels 2>/dev/null | grep -q "cuda"; then
@@ -480,9 +588,446 @@ hw_accel_auto() {
     fi
 }
 
+# ── 硬件加速：探测 + 交互选择（仅解码）────────────────
+fftools_choose_hwaccel() {
+    local hw use
+    hw=$(hw_accel_auto)
+    [[ -z "$hw" ]] && return 0
+    use=$(printf "使用硬件加速 ($hw)\n使用软件编码" \
+        | fzf "${FZF_BASE[@]}" --height 25% --header '硬件加速') || return 0
+    [[ "$use" == 使用硬件* ]] && printf '%s\n' "$hw"
+}
+
+# 软件编码器 → 对应 NVENC 编码器（检测可用性后输出）
+fftools_nvenc_of() {
+    case "$1" in
+        libx264)   ffmpeg -hide_banner -encoders 2>/dev/null | grep -q ' h264_nvenc ' && printf 'h264_nvenc\n' ;;
+        libx265)   ffmpeg -hide_banner -encoders 2>/dev/null | grep -q ' hevc_nvenc ' && printf 'hevc_nvenc\n' ;;
+        libsvtav1) ffmpeg -hide_banner -encoders 2>/dev/null | grep -q ' av1_nvenc ' && printf 'av1_nvenc\n' ;;
+    esac
+}
+
 # ── 标准化音频滤镜 ─────────────────────────────────────
 loudnorm_filter() {
     echo "loudnorm=I=-16:TP=-1.5:LRA=11"
+}
+
+# ── 音频编码器参数（源自 FFmpegFreeUI 音频编码器数据库）──
+audio_codec_args() {
+    case "$1" in
+        m4a|aac) printf '%s\n' -c:a aac -b:a 192k ;;
+        mp3)     printf '%s\n' -c:a libmp3lame -b:a 192k ;;
+        opus)    printf '%s\n' -c:a libopus -b:a 128k ;;
+        wav)     printf '%s\n' -c:a pcm_s16le ;;
+        ogg)     printf '%s\n' -c:a libvorbis -b:a 192k ;;
+        flac)    printf '%s\n' -c:a flac ;;
+        alac)    printf '%s\n' -c:a alac ;;
+        ac3)     printf '%s\n' -c:a ac3 -b:a 448k ;;
+        *)       return 1 ;;
+    esac
+}
+
+# ── 编码器 → 文件扩展名（源自 3FUI 抽流工具）─────────
+codec_extension() {
+    case "$1" in
+        h264|avc) echo h264 ;;
+        hevc|h265) echo h265 ;;
+        mpeg1video) echo m1v ;;
+        mpeg2video) echo m2v ;;
+        mpeg4) echo m4v ;;
+        vc1) echo vc1 ;;
+        vp8|vp9|av1) echo ivf ;;
+        theora) echo ogv ;;
+        prores) echo mov ;;
+        mjpeg) echo mjpg ;;
+        jpegxl) echo jxl ;;
+        rawvideo) echo raw ;;
+        aac) echo aac ;;
+        ac3) echo ac3 ;;
+        eac3) echo eac3 ;;
+        truehd) echo thd ;;
+        mlp) echo mlp ;;
+        dts|dca) echo dts ;;
+        mp1) echo mp1 ;;
+        mp2) echo mp2 ;;
+        mp3) echo mp3 ;;
+        flac) echo flac ;;
+        opus) echo opus ;;
+        vorbis) echo ogg ;;
+        alac) echo m4a ;;
+        ape) echo ape ;;
+        tta) echo tta ;;
+        wavpack) echo wv ;;
+        amr_nb|amr_wb) echo amr ;;
+        pcm_s8|pcm_s16le|pcm_s16be|pcm_s24le|pcm_s24be|pcm_s32le|pcm_s32be|pcm_f32le|pcm_f64le) echo wav ;;
+        subrip) echo srt ;;
+        ass|ssa) echo ass ;;
+        webvtt) echo vtt ;;
+        mov_text) echo srt ;;
+        hdmv_pgs_subtitle) echo sup ;;
+        dvd_subtitle) echo sub ;;
+        dvb_subtitle) echo dvb ;;
+        *) echo bin ;;
+    esac
+}
+
+# ── 质量评测滤镜片段（源自 3FUI 质量评测工具）────────
+# 用法: fftools_metric_filter <psnr|ssim|xpsnr|vmaf> <统计文件>
+# 调用方需自行拼接 [dist]/[ref] 预处理滤镜
+fftools_metric_filter() {
+    local metric="$1" stats="$2"
+    # 统计/日志路径需按滤镜参数规则转义，否则路径中的 : ' , 会破坏 filtergraph
+    stats=${stats//\\/\\\\}
+    stats=${stats//:/\\:}
+    stats=${stats//\'/\\\'}
+    stats=${stats//,/\\,}
+    case "$metric" in
+        psnr)  printf '[dist][ref]psnr=eof_action=endall:stats_file=%s' "$stats" ;;
+        ssim)  printf '[dist][ref]ssim=eof_action=endall:stats_file=%s' "$stats" ;;
+        xpsnr) printf '[ref][dist]xpsnr=eof_action=endall:stats_file=%s' "$stats" ;;
+        vmaf)  local vmaf_args="pool=${FZF_VMAF_POOL:-mean}"
+               [[ -n "${FZF_VMAF_MODEL:-}" ]] && vmaf_args="model=$(escape_subtitle_path "$FZF_VMAF_MODEL"):$vmaf_args"
+               printf '[dist][ref]libvmaf=eof_action=endall:ts_sync_mode=nearest:log_fmt=json:log_path=%s:n_threads=%s:%s' \
+                    "$stats" "${FZF_VMAF_THREADS:-0}" "$vmaf_args" ;;
+    esac
+}
+
+# ── 降噪滤镜（源自 3FUI 滤镜系统）────────────────────
+# 用法: fftools_denoise <hqdn3d|nlmeans|atadenoise|bm3d> <轻|中|强>
+fftools_denoise() {
+    local method="${1:-hqdn3d}" strength="${2:-中}"
+    case "$method:$strength" in
+        hqdn3d:轻)     printf 'hqdn3d=1.5:1.5:3:3' ;;
+        hqdn3d:强)     printf 'hqdn3d=4:3:6:4.5' ;;
+        hqdn3d:*)      printf 'hqdn3d=3:2:5:4' ;;
+        nlmeans:轻)    printf 'nlmeans=s=1:p=1:pc=1:r=3' ;;
+        nlmeans:强)    printf 'nlmeans=s=5:p=5:pc=7:r=7' ;;
+        nlmeans:*)     printf 'nlmeans=s=3:p=3:pc=5:r=5' ;;
+        atadenoise:轻) printf 'atadenoise=0a=1:0b=1:1a=1:1b=1' ;;
+        atadenoise:强) printf 'atadenoise=0a=5:0b=5:1a=5:1b=5' ;;
+        atadenoise:*)  printf 'atadenoise=0a=3:0b=3:1a=3:1b=3' ;;
+        bm3d:轻)       printf 'bm3d=sigma=1:block=4:bstep=2:group=1' ;;
+        bm3d:强)       printf 'bm3d=sigma=5:block=8:bstep=4:group=2' ;;
+        bm3d:*)        printf 'bm3d=sigma=3:block=8:bstep=4:group=1' ;;
+    esac
+}
+
+# ── 锐化滤镜（源自 3FUI 滤镜系统）────────────────────
+# 用法: fftools_sharpen <unsharp|cas> <轻|中|强>
+fftools_sharpen() {
+    local method="${1:-unsharp}" strength="${2:-中}"
+    case "$method:$strength" in
+        cas:轻)     printf 'cas=strength=0.2' ;;
+        cas:强)     printf 'cas=strength=0.8' ;;
+        cas:*)      printf 'cas=strength=0.5' ;;
+        unsharp:轻) printf 'unsharp=5:5:0.3' ;;
+        unsharp:强) printf 'unsharp=5:5:1.0' ;;
+        unsharp:*)  printf 'unsharp=5:5:0.6' ;;
+    esac
+}
+
+# ── 智能补帧（源自 3FUI 插帧滤镜）────────────────────
+# 用法: fftools_interpolate <目标帧率> <mci|mcn>
+fftools_interpolate() {
+    local fps="${1:-60}" mode="${2:-mci}"
+    printf 'minterpolate=fps=%s:mi_mode=%s:me_mode=bidir:mc_mode=aobmc' "$fps" "$mode"
+}
+
+# ── 动态模糊（源自 3FUI 动态模糊滤镜）────────────────
+# 用法: fftools_tmix <混合帧数 2~4>
+fftools_tmix() {
+    printf 'tmix=frames=%s' "${1:-3}"
+}
+
+# ── 胶片颗粒（源自 3FUI 胶片颗粒滤镜）────────────────
+# 用法: fftools_grain <轻|中|强>
+fftools_grain() {
+    case "${1:-中}" in
+        轻) printf 'noise=alls=5:allf=t+u' ;;
+        强) printf 'noise=alls=16:allf=t+u' ;;
+        *)  printf 'noise=alls=10:allf=t+u' ;;
+    esac
+}
+
+# ── 平滑断层/去色带（源自 3FUI 平滑断层滤镜）──────────
+# 用法: fftools_deband <轻|中|强|gradfun>
+fftools_deband() {
+    case "${1:-中}" in
+        轻)      printf 'deband=1thr=0.012:2thr=0.012:3thr=0.012:range=12:blur=1' ;;
+        强)      printf 'deband=1thr=0.03:2thr=0.03:3thr=0.03:range=24:blur=1:coupling=1' ;;
+        gradfun) printf 'gradfun=1.2:16' ;;
+        *)       printf 'deband=1thr=0.02:2thr=0.02:3thr=0.02:range=16:blur=1' ;;
+    esac
+}
+
+# ── 去隔行/反胶卷下拉（源自 3FUI 扫描方式滤镜）────────
+# 用法: fftools_deinterlace <yadif|yadif_field|bwdif|ivtc>
+fftools_deinterlace() {
+    case "${1:-yadif}" in
+        yadif_field) printf 'yadif=mode=send_field:parity=auto:deint=all' ;;
+        bwdif)       printf 'bwdif=mode=send_frame:parity=auto:deint=all' ;;
+        ivtc)        printf 'fieldmatch,yadif=deint=interlaced,decimate' ;;
+        *)           printf 'yadif=mode=send_frame:parity=auto:deint=all' ;;
+    esac
+}
+
+# ── 画面翻转/旋转（源自 3FUI 画面翻转滤镜）────────────
+# 用法: fftools_transpose <顺时针|逆时针|180|水平|垂直>
+fftools_transpose() {
+    case "${1:-顺时针}" in
+        逆时针) printf 'transpose=2' ;;
+        180)    printf 'transpose=1,transpose=1' ;;
+        水平)   printf 'hflip' ;;
+        垂直)   printf 'vflip' ;;
+        *)      printf 'transpose=1' ;;
+    esac
+}
+
+# ── 抽帧：去掉重复/近似重复帧（源自 3FUI 抽帧滤镜）────
+# 用法: fftools_mpdecimate <轻|强>
+fftools_mpdecimate() {
+    case "${1:-轻}" in
+        强) printf 'mpdecimate=hi=6*12:lo=6*5:frac=0.33,setpts=N/FRAME_RATE/TB' ;;
+        *)  printf 'mpdecimate,setpts=N/FRAME_RATE/TB' ;;
+    esac
+}
+
+# ── 调色（亮度/对比度/饱和度/Gamma）──────────────────
+# 用法: fftools_eq "亮度:对比度:饱和度:Gamma"（可缺省某段，如 "::1.1"）
+fftools_eq() {
+    local b c s g
+    IFS=: read -r b c s g <<< "${1:-}"
+    local out=""
+    [[ -n "${b:-}" ]] && out+="brightness=$b:"
+    [[ -n "${c:-}" ]] && out+="contrast=$c:"
+    [[ -n "${s:-}" ]] && out+="saturation=$s:"
+    [[ -n "${g:-}" ]] && out+="gamma=$g:"
+    [[ -n "$out" ]] && printf '%s' "eq=${out%:}"
+}
+
+# ── 超分/高质量缩放（libplacebo，源自 3FUI 超分滤镜）──
+# 用法: fftools_superres <宽:高> [缩放算法] [自定义shader路径]
+# 缩放算法可选: ewa_lanczossharp ewa_lanczos4sharpest lanczos bicubic bilinear 等
+fftools_superres() {
+    local wh="$1" scaler="${2:-ewa_lanczossharp}" shader="${3:-}"
+    local w="${wh%%:*}" h="${wh#*:}"
+    local out="libplacebo=w=$w:h=$h:upscaler=$scaler:downscaler=none:antiringing=0.7"
+    [[ -n "$shader" && -f "$shader" ]] && out+=":custom_shader_path=$(escape_subtitle_path "$shader")"
+    printf '%s' "$out"
+}
+
+# ── 发现本地 VMAF 模型（源自 3FUI 质量评测模型选择）───
+# 输出: 模型路径列表（系统目录与用户目录）
+fftools_vmaf_models() {
+    local -a dirs=(
+        "/usr/share/model"
+        "/usr/share/vmaf/models"
+        "${XDG_DATA_HOME:-$HOME/.local/share}/vmaf-models"
+    )
+    local d
+    for d in "${dirs[@]}"; do
+        [[ -d "$d" ]] || continue
+        find "$d" -maxdepth 2 -name '*.json' -type f 2>/dev/null
+    done | sort -u
+}
+
+# ── 编码器高级选项（tune/无损，源自 3FUI 编码器数据库）─
+# 输出到 stdout 的参数会被追加到编码参数之后；返回 1=用户取消
+fftools_advanced_args() {
+    local venc="$1" tune lossless
+    case "$venc" in
+        libx265|libx264|hevc_nvenc|av1_nvenc|h264_nvenc) ;;
+        *) return 0 ;;
+    esac
+    local tunes=""
+    case "$venc" in
+        libx265) tunes="不设置 psnr ssim grain fastdecode zerolatency animation stillimage" ;;
+        libx264) tunes="不设置 psnr ssim grain fastdecode zerolatency animation stillimage" ;;
+        *nvenc)  tunes="不设置 hq ull ll lossless" ;;
+    esac
+    tune=$(printf '%s\n' $tunes | fzf "${FZF_BASE[@]}" --height 35% --header "tune 调优（回车=不设置）") || return 1
+    [[ -z "$tune" || "$tune" == 不设置 ]] || printf '%s\n' "-tune" "$tune"
+    lossless=$(printf '%s\n' '否' '是（真正无损，体积巨大）' \
+        | fzf "${FZF_BASE[@]}" --height 25% --header '无损模式') || return 1
+    case "$lossless" in
+        是*) case "$venc" in
+                 libx265) printf '%s\n' "-x265-params" "lossless=1" ;;
+                 libx264) printf '%s\n' "-qp" "0" ;;
+                 *nvenc)  printf '%s\n' "-tune" "lossless" ;;
+             esac ;;
+    esac
+    return 0
+}
+
+# ── 编码器默认参数（源自 3FUI 数据库）────────────────
+# 用法: encoder_default <编码器> <preset|quality> → 输出 "参数名 默认值"
+encoder_default() {
+    local enc="$1" kind="$2" item flag range default
+    local -n list
+    [[ "$kind" == preset ]] && list=PSMAP || list=QMAP
+    for item in "${list[@]}"; do
+        if [[ "$item" == "$enc:"* ]]; then
+            IFS=: read -r _ flag range default <<< "$item"
+            printf '%s %s\n' "$flag" "$default"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ── 批量编码器选择菜单（源自 3FUI 数据库）────────────
+# 用法: venc=$(fftools_pick_encoder) || exit 0
+fftools_pick_encoder() {
+    local encoder_menu=() item enc d
+    local -a unavailable=()
+    local encoders_list
+    encoders_list=$(ffmpeg -hide_banner -encoders 2>/dev/null)
+    for item in "${QMAP[@]}"; do
+        enc="${item%%:*}"
+        case "$enc" in
+            libx265)     d="软件 H.265 · 体积小、画质好" ;;
+            libx264)     d="软件 H.264 · 兼容最好" ;;
+            libsvtav1)   d="软件 AV1 · 快且省体积" ;;
+            libaom-av1)  d="软件 AV1 · 最省体积、极慢" ;;
+            librav1e)    d="软件 AV1 · rav1e" ;;
+            libsvt_hevc) d="软件 H.265 · SVT 引擎" ;;
+            libvpx-vp9)  d="软件 VP9 · 网页友好" ;;
+            libvvenc)    d="软件 H.266/VVC · 下一代编码" ;;
+            libvpx)      d="软件 VP8 · 老旧网页格式" ;;
+            ffv1)        d="FFv1 · 归档无损" ;;
+            av1_nvenc)   d="N卡硬件 AV1 · 快" ;;
+            hevc_nvenc)  d="N卡硬件 H.265 · 快" ;;
+            h264_nvenc)  d="N卡硬件 H.264 · 快" ;;
+            av1_qsv)     d="Intel 硬件 AV1 · 快" ;;
+            hevc_qsv)    d="Intel 硬件 H.265 · 快" ;;
+            h264_qsv)    d="Intel 硬件 H.264 · 快" ;;
+            av1_vulkan)  d="Vulkan 硬件 AV1" ;;
+            hevc_vulkan) d="Vulkan 硬件 H.265" ;;
+            h264_vulkan) d="Vulkan 硬件 H.264" ;;
+            *) continue ;;
+        esac
+        # 本机 ffmpeg 未编译的编码器不进菜单，避免选了必失败
+        if ! grep -q " $enc " <<< "$encoders_list"; then
+            unavailable+=("$enc")
+            continue
+        fi
+        encoder_menu+=("$enc|$d")
+    done
+    (( ${#unavailable[@]} > 0 )) && printf '本机未编译，已从菜单隐藏: %s\n' "${unavailable[*]}" >&2
+    printf '%s\n' "${encoder_menu[@]}" \
+        | fzf "${FZF_BASE[@]}" --height 40% --delimiter='|' --with-nth=2 --header '选择编码方式' \
+        | cut -d'|' -f1
+}
+
+# ── 编码器默认参数（写入全局 ENCODE_ARGS / PIX_VALUE）──
+# 用法: fftools_encoder_setup <编码器>
+fftools_encoder_setup() {
+    local venc="$1" pflag="" preset_default="" qflag="" quality_default="" info pix
+    ENCODE_ARGS=()
+    PIX_VALUE=""
+    if info=$(encoder_default "$venc" preset); then
+        read -r pflag preset_default <<< "$info"
+    fi
+    if info=$(encoder_default "$venc" quality); then
+        read -r qflag quality_default <<< "$info"
+    fi
+    [[ -n "$pflag" && -n "$preset_default" ]] && ENCODE_ARGS+=("$pflag" "$preset_default")
+    [[ -n "$qflag" && -n "$quality_default" ]] && ENCODE_ARGS+=("$qflag" "$quality_default")
+    pix=$(pix_fmt "$venc")
+    [[ -n "$pix" ]] && PIX_VALUE="${pix#-pix_fmt }"
+}
+
+# ── 解析 HH:MM:SS(.xx) 为秒 ───────────────────────────
+fftools_parse_time() {
+    local hms="$1" h m s
+    IFS=: read -r h m s <<< "$hms"
+    awk -v h="${h:-0}" -v m="${m:-0}" -v s="${s:-0}" \
+        'BEGIN { printf "%.1f", h*3600+m*60+s }'
+}
+
+# ── 运行命令并实时显示 ffmpeg 进度/速度/码率 ─────────
+# 用法: fftools_run_live <命令...>（自动探测第一个 -i 输入的时长）
+fftools_run_live() {
+    local cmd=("$@") input="" duration="" status log_path
+    local prev=""
+    for arg in "${cmd[@]}"; do
+        if [[ "$prev" == "-i" ]]; then
+            input="$arg"
+            break
+        fi
+        prev="$arg"
+    done
+    if [[ -n "$input" && -f "$input" ]]; then
+        duration=$(ffprobe -v error -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 -- "$input" 2>/dev/null | head -1)
+    fi
+
+    mkdir -p -- "$FFTOOLS_STATE_DIR/logs"
+    log_path="$FFTOOLS_STATE_DIR/logs/$(date +%Y%m%d-%H%M%S)-$$.log"
+    printf '\n命令：'
+    printf ' %q' "${cmd[@]}"
+    printf '\n日志：%s\n\n' "$log_path"
+    fftools_log "start: $(printf '%q ' "${cmd[@]}")"
+
+    local tty=0
+    [[ -t 1 ]] && tty=1
+    command "${cmd[@]}" 2>&1 | tee "$log_path" | while IFS= read -r line; do
+        [[ "$line" == *"frame="* ]] || continue
+        local time_str speed fps bitrate size frame sec pct
+        time_str=$(grep -o 'time=[0-9:.+-]*' <<< "$line" | head -1 | cut -d= -f2)
+        speed=$(grep -o 'speed=[0-9.]*x' <<< "$line" | head -1 | cut -d= -f2)
+        fps=$(grep -o 'fps=[0-9.]*' <<< "$line" | head -1 | cut -d= -f2)
+        bitrate=$(grep -o 'bitrate=[0-9.]*kbits/s' <<< "$line" | head -1 | cut -d= -f2)
+        size=$(grep -o 'size=[0-9.]*kB' <<< "$line" | head -1 | cut -d= -f2)
+        frame=$(grep -o 'frame=[0-9]*' <<< "$line" | head -1 | cut -d= -f2)
+        sec=""
+        [[ -n "$time_str" ]] && sec=$(fftools_parse_time "$time_str")
+        pct=""
+        if [[ -n "$duration" && -n "$sec" && "$duration" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            pct=$(awk -v d="$duration" -v s="$sec" \
+                'BEGIN { p=s*100/d; if (p>100) p=100; printf "%d", p }')
+        fi
+        if (( tty )); then
+            printf '\r'
+            if [[ -n "$pct" ]]; then
+                local filled=$((pct * 20 / 100)) empty=$((20 - filled)) bar rest
+                printf -v bar '%*s' "$filled" ''
+                printf -v rest '%*s' "$empty" ''
+                bar=${bar// /#}
+                rest=${rest// /-}
+                printf '[%s%s] %3d%%' "$bar" "$rest" "$pct"
+            fi
+            [[ -n "$time_str" ]] && printf ' %s' "$time_str"
+            [[ -n "$speed" ]] && printf ' 速度%s' "$speed"
+            [[ -n "$fps" ]] && printf ' %sfps' "$fps"
+            [[ -n "$bitrate" ]] && printf ' 码率%sk' "$bitrate"
+            printf ' '
+        fi
+    done
+    status=${PIPESTATUS[0]}
+    (( tty )) && printf '\n'
+    fftools_log "finished($status): $log_path"
+    return "$status"
+}
+
+# ── 编码器二次编码支持（源自 FFmpegFreeUI 数据库）──────
+encoder_supports_2pass() {
+    case "$1" in
+        libx264|libx265|libsvtav1|libaom-av1|libvpx-vp9|libsvt_hevc|librav1e|libvvenc|libvpx) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 二次编码：pass1 分析 → pass2 输出（需码率控制参数如 -b:v）
+# 用法: encode_2pass <输入> <输出> [额外视频/音频参数...]
+encode_2pass() {
+    local input="$1" output="$2" logbase
+    local -a extra=("${@:3}")
+    logbase="${output%.*}_passlog"
+    fftools_run ffmpeg -y -i "$input" "${extra[@]}" \
+        -pass 1 -passlogfile "$logbase" -an -f null /dev/null || return 1
+    fftools_run ffmpeg -y -i "$input" "${extra[@]}" \
+        -pass 2 -passlogfile "$logbase" "$output"
 }
 
 # ── 自动检测电池路径 ───────────────────────────────────

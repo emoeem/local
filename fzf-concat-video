@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fzf-concat-video:summary=Concatenate multiple videos into one via fzf.
+# fzf-concat-video:summary=把多个视频按顺序接成一个（可无损、可重编码）。
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -11,7 +11,8 @@ if [[ $# -ge 2 ]]; then
     videos=("$@")
 else
     require_tools fzf fd || exit 1
-    mapfile -t videos < <(pick_videos)
+    mapfile -t videos < <(pick_videos) || exit 0
+    (( ${#videos[@]} > 0 )) || exit 0
     mapfile -t videos < <(printf '%s\n' "${videos[@]}" | sort -V)
 fi
 (( ${#videos[@]} < 2 )) && { echo "至少需要2个视频"; exit 1; }
@@ -32,14 +33,8 @@ fi
 listfile=$(mktemp /tmp/ffconcat_XXXXXX.txt)
 trap 'rm -f -- "$listfile"' EXIT
 
-concat_escape_path() {
-    local path="$1"
-    path=${path//\'/\'\\\'\'}
-    printf "'%s'" "$path"
-}
-
 for v in "${videos[@]}"; do
-    printf 'file %s\n' "$(concat_escape_path "$(realpath -- "$v")")" >> "$listfile"
+    printf 'file %s\n' "$(fftools_concat_escape "$(realpath -- "$v")")" >> "$listfile"
 done
 
 printf '\n拼接顺序:\n'
@@ -47,7 +42,7 @@ cat -n "$listfile"
 printf '\n'
 
 output="concat_output.mp4"
-read -r -p "输出 [$output]: " custom
+read -r -p "输出 [$output]: " custom || exit 0
 output="${custom:-$output}"
 
 if [[ "${consistent:-false}" == true && "${reencode:-false}" != true ]]; then
