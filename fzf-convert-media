@@ -185,8 +185,8 @@ case "$target" in
     png*)      fftools_run ffmpeg -i "$file" -y "$output" || status=$? ;;
     webp-80*)  fftools_run ffmpeg -i "$file" -c:v libwebp -quality 80 -y "$output" || status=$? ;;
     webp-ll*)  fftools_run ffmpeg -i "$file" -c:v libwebp -lossless 1 -y "$output" || status=$? ;;
-    jxl*)      fftools_run ffmpeg -i "$file" -c:v libjxl -distance 1 -effort 7 -y "$output" || status=$? ;;
     jxl-ls*)   fftools_run ffmpeg -i "$file" -c:v libjxl -lossless 1 -effort 7 -y "$output" || status=$? ;;
+    jxl*)      fftools_run ffmpeg -i "$file" -c:v libjxl -distance 1 -effort 7 -y "$output" || status=$? ;;
     tiff*)     fftools_run ffmpeg -i "$file" -y "$output" || status=$? ;;
     bmp*)      fftools_run ffmpeg -i "$file" -y "$output" || status=$? ;;
     *)         echo "❌ 不支持的格式: $target"; exit 1 ;;

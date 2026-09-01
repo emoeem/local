@@ -18,6 +18,6 @@ fmt_key="${fmt%% *}"
 output=$(fftools_output_prompt "$video" "${video%.*}.${fmt_key}")
 
 ac_str=$(audio_codec_args "$fmt_key") || { echo "未知格式: $fmt_key" >&2; exit 1; }
-read -r -a ac <<< "$ac_str"
+mapfile -t ac <<< "$ac_str"
 
 fftools_run ffmpeg -i "$video" -vn "${ac[@]}" -y "$output"

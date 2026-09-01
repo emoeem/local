@@ -62,7 +62,6 @@ case " ${metrics[*]} " in
         mapfile -t models < <(fftools_vmaf_models)
         if (( ${#models[@]} > 0 )); then
             model_menu=("内置默认\tffmpeg 自带 vmaf 默认模型")
-            local_path="${XDG_DATA_HOME:-$HOME/.local/share}/vmaf-models"
             for m in "${models[@]}"; do
                 model_menu+=("$(basename -- "$m")\t$m")
             done

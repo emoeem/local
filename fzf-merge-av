@@ -54,7 +54,7 @@ validate_media() {
 declare -A vfile_map
 declare -A afile_map
 
-video_exts=(-iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' -o -iname '*.mov' -o -iname '*.avi' -o -iname '*.flv' -o -iname '*.m4v')
+video_exts=(-iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' -o -iname '*.mov' -o -iname '*.avi' -o -iname '*.flv' -o -iname '*.m4v' -o -iname '*.ts')
 audio_exts=(-iname '*.m4a' -o -iname '*.mp3' -o -iname '*.aac' -o -iname '*.opus' -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.flac')
 
 while IFS= read -r -d '' file; do

@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 # fzf-generate-subs:summary=用 Whisper 自动生成字幕，还能顺便翻译成双语。
 set -euo pipefail

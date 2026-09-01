@@ -79,8 +79,8 @@ while true; do
     elif [[ "$CMD" == "__cache" ]]; then
         choice=$(printf '%s\n' 'status' 'prune (清理30天前缓存)' 'clear (清空全部缓存)' | fzf --height 30% --header '预览缓存') || continue
         fftools_cache "${choice%% *}"
-    elif command -v "$CMD" &>/dev/null; then
-        "$CMD"
+    elif [[ -x "$script_dir/$CMD" ]]; then
+        "$script_dir/$CMD"
         echo
         read -r -p "按 Enter 返回菜单..."
     else

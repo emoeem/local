@@ -528,14 +528,13 @@ build_atempo_chain() {
     local factor="$1"
     local filters=()
     local remaining="$factor"
-    export LC_ALL=C
-    while awk "BEGIN{exit !($remaining>2.0)}"; do
+    while LC_ALL=C awk "BEGIN{exit !($remaining>2.0)}"; do
         filters+=("atempo=2.0")
-        remaining=$(awk "BEGIN{printf \"%.4f\", $remaining/2.0}")
+        remaining=$(LC_ALL=C awk "BEGIN{printf \"%.4f\", $remaining/2.0}")
     done
-    while awk "BEGIN{exit !($remaining<0.5)}"; do
+    while LC_ALL=C awk "BEGIN{exit !($remaining<0.5)}"; do
         filters+=("atempo=0.5")
-        remaining=$(awk "BEGIN{printf \"%.4f\", $remaining/0.5}")
+        remaining=$(LC_ALL=C awk "BEGIN{printf \"%.4f\", $remaining/0.5}")
     done
     filters+=("atempo=$remaining")
     local IFS=','

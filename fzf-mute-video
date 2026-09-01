@@ -14,7 +14,14 @@ total=${#videos[@]}
 ok=0
 fail=0
 for v in "${videos[@]}"; do
-    output="${v%.*}_muted.${v##*.}"
+    base="${v%.*}"; ext="${v##*.}"
+    [[ "$base" == "$v" ]] && { base="$v"; ext=""; }
+    output="${base}_muted${ext:+.$ext}"
+    index=1
+    while [[ -e "$output" ]]; do
+        output="${base}_muted-${index}${ext:+.$ext}"
+        ((++index))
+    done
     printf '%s → %s ... ' "$v" "$output"
     if ffmpeg -v error -i "$v" -c copy -an -y "$output"; then
         ((++ok))

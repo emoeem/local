@@ -9,12 +9,13 @@ if [[ -z "$input" ]]; then
     input=$(pick_video) || exit
 fi
 base="${input%.*}"
-modes=("HDR10→SDR  HDR 压到标准色域"
-    "SDR→HDR10    SDR 升到 HDR"
-    "BT.709→2020  标准色域转广色域"
-    "注入元数据    手动指定 mastering/cll")
+modes=("HDR10→SDR"$'\t'"HDR 压到标准色域 (hable tonemap)"
+    "SDR→HDR10"$'\t'"SDR 升到 HDR (可设峰值 nit)"
+    "BT.709→2020"$'\t'"标准色域转广色域"
+    "注入元数据"$'\t'"仅写 HDR mastering/cll 元数据 (仅支持 HEVC)")
 mode=$(printf '%s\n' "${modes[@]}" | fzf "${FZF_BASE[@]}" --header '色彩转换' \
-    --preview 'echo "{2}"' --preview-window 'bottom:1' | awk '{print $1}') || exit
+    --delimiter=$'\t' --with-nth=1,2 \
+    --preview 'echo "{2}"' --preview-window 'bottom:1' | cut -f1) || exit
 
 case "$mode" in
     HDR10→SDR)
@@ -25,6 +26,12 @@ case "$mode" in
     BT.709→2020)
         cmd=(ffmpeg -i "$input" -vf 'zscale=primaries=bt2020:matrix=bt2020nc:transfer=bt709,format=yuv420p10le' -c:v libx265 -crf 20 -pix_fmt yuv420p10le -c:a copy "${base}_bt2020.mp4") ;;
     注入元数据)
+        codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
+            -of csv=p=0 -- "$input" 2>/dev/null | head -1)
+        if [[ "$codec" != hevc ]]; then
+            echo "❌ hevc_metadata 只支持 HEVC/H.265 视频，当前视频编码: ${codec:-未知}" >&2
+            exit 1
+        fi
         echo -n "master-display [G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50)]: "; read -r md
         [[ -z "$md" ]] && md="G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50)"
         echo -n "max-cll [1000,400]: "; read -r mcll; [[ -z "$mcll" ]] && mcll="1000,400"
