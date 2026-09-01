@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# fzf-image-batch:summary=批量图片工具：一次把多张图片转换格式并缩放尺寸（类似 Converseen）。
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/fzf-fftools-lib"
+
+require_tools ffmpeg ffprobe || exit 1
+
+usage() {
+    cat <<'EOF'
+用法:
+  fzf-image-batch [选项] [图片...]
+
+选项:
+  --output-dir DIR    输出目录（默认交互询问，回车=./image_out）
+  --force             允许覆盖已存在的同名输出
+  -h, --help          显示帮助
+
+无参数时交互多选图片，然后依次选择目标格式、质量、缩放方式。
+EOF
+}
+
+force=false
+output_dir=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --force) force=true ;;
+        --output-dir)
+            [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+            output_dir="$2"; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) break ;;
+    esac
+    shift
+done
+
+if (( $# > 0 )); then
+    mapfile -t inputs < <(printf '%s\n' "$@")
+else
+    require_tools fzf fd || exit 1
+    mapfile -t inputs < <(
+        media_candidates '\.(jpg|jpeg|png|webp|bmp|gif|tiff|tif|avif|heic|heif|jxl|apng)$' |
+            fzf "${FZF_BASE[@]}" "${FZF_MULTI_BASE[@]}" \
+                --header '选择图片 · Tab 多选 · Ctrl-A 全选' --preview "$PVID {}")
+fi
+(( ${#inputs[@]} > 0 )) || exit 0
+
+# ── 目标格式 ───────────────────────────────────────────
+fmt=$(printf '%s\n' \
+    'jpg    JPEG 照片通用，所有设备兼容' \
+    'webp   WebP 比 JPEG 小约 40%，支持透明' \
+    'png    PNG 无损，支持透明通道' \
+    'avif   AVIF 压缩率最高，体积最小' \
+    'jxl    JPEG XL 无损' \
+    'tiff   TIFF 无损，印刷/存档用' \
+    'bmp    BMP 无压缩位图' \
+    | fzf "${FZF_BASE[@]}" --height 40% --header '目标格式') || exit 0
+fmt=${fmt%% *}
+
+# ── 质量（仅有损格式需要）───────────────────────────────
+quality_args=()
+case "$fmt" in
+    jpg)
+        q=$(printf '%s\n' '高 (q2 接近原图)' '中 (q5 平衡)' '低 (q8 体积小)' \
+            | fzf "${FZF_BASE[@]}" --height 30% --header 'JPEG 质量') || exit 0
+        case "${q%% *}" in
+            高) quality_args=(-q:v 2) ;;
+            中) quality_args=(-q:v 5) ;;
+            低) quality_args=(-q:v 8) ;;
+        esac ;;
+    webp)
+        q=$(printf '%s\n' '高 (quality 90)' '中 (quality 80)' '低 (quality 60)' '无损 (lossless)' \
+            | fzf "${FZF_BASE[@]}" --height 30% --header 'WebP 质量') || exit 0
+        case "${q%% *}" in
+            高)   quality_args=(-c:v libwebp -quality 90) ;;
+            中)   quality_args=(-c:v libwebp -quality 80) ;;
+            低)   quality_args=(-c:v libwebp -quality 60) ;;
+            无损) quality_args=(-c:v libwebp -lossless 1) ;;
+        esac ;;
+    avif)
+        q=$(printf '%s\n' '高 (crf 20)' '中 (crf 28)' '低 (crf 36)' \
+            | fzf "${FZF_BASE[@]}" --height 30% --header 'AVIF 质量') || exit 0
+        q=$(fftools_first_number "$q")
+        quality_args=(-c:v libaom-av1 -still-picture 1 -crf "$q" -b:v 0 -row-mt 1 -cpu-used 6) ;;
+    jxl)
+        quality_args=(-c:v libjxl -lossless 1 -effort 7) ;;
+esac
+
+# ── 缩放方式 ───────────────────────────────────────────
+resize=$(printf '%s\n' \
+    '原尺寸  不缩放' \
+    '75%     缩小到 75%' \
+    '50%     缩小到一半' \
+    '25%     缩小到四分之一' \
+    '最长边  限制最长边像素（网页/壁纸常用）' \
+    '宽度    指定宽度，高度按比例' \
+    '高度    指定高度，宽度按比例' \
+    | fzf "${FZF_BASE[@]}" --height 40% --header '缩放') || exit 0
+
+vf=()
+case "${resize%% *}" in
+    原尺寸) ;;
+    75%|50%|25%)
+        p=$(fftools_first_number "$resize")
+        # 缩放后取偶数，避免部分编码器拒绝奇数尺寸
+        vf=(-vf "scale=trunc(iw*${p}/100/2)*2:trunc(ih*${p}/100/2)*2") ;;
+    最长边)
+        read -r -p "最长边像素 [1920]: " px || true
+        px=${px:-1920}
+        [[ "$px" =~ ^[1-9][0-9]*$ ]] || { echo "无效像素: $px" >&2; exit 1; }
+        vf=(-vf "scale=w=${px}:h=${px}:force_original_aspect_ratio=decrease:force_divisible_by=2") ;;
+    宽度)
+        read -r -p "宽度像素: " px || true
+        [[ "$px" =~ ^[1-9][0-9]*$ ]] || { echo "无效像素: $px" >&2; exit 1; }
+        vf=(-vf "scale=${px}:-2") ;;
+    高度)
+        read -r -p "高度像素: " px || true
+        [[ "$px" =~ ^[1-9][0-9]*$ ]] || { echo "无效像素: $px" >&2; exit 1; }
+        vf=(-vf "scale=-2:${px}") ;;
+esac
+
+# ── 输出目录 ───────────────────────────────────────────
+if [[ -z "$output_dir" ]]; then
+    printf '输出目录 [%s/image_out]: ' "$(pwd)"
+    read -r output_dir || true
+    output_dir=${output_dir:-"$PWD/image_out"}
+fi
+[[ "$output_dir" == /* ]] || output_dir="$PWD/$output_dir"
+
+# ── 批量处理 ───────────────────────────────────────────
+total=${#inputs[@]}
+ok=0
+fail=0
+for input in "${inputs[@]}"; do
+    if [[ ! -f "$input" ]]; then
+        printf '✗ 文件不存在: %s\n' "$input" >&2
+        ((++fail))
+        continue
+    fi
+    output=$(fftools_output_path "$input" "" "$fmt" "$output_dir" "$force")
+    # 输出目录就是源目录且格式未变时，避免覆盖源文件
+    if [[ "$(realpath -m -- "$output")" == "$(realpath -m -- "$input")" ]]; then
+        output=$(fftools_output_path "$input" "_converted" "$fmt" "$output_dir" "$force")
+    fi
+    printf '[%d/%d] %s → %s\n' "$((ok + fail + 1))" "$total" \
+        "$(basename -- "$input")" "$(basename -- "$output")"
+    # -update 1 仅 image2 系 muxer（jpg/png/webp/tiff/bmp）可用，avif/jxl 不能加
+    update_args=()
+    case "$fmt" in
+        jpg|png|webp|tiff|bmp) update_args=(-update 1) ;;
+    esac
+    if fftools_run ffmpeg -i "$input" "${vf[@]}" "${quality_args[@]}" \
+        -frames:v 1 "${update_args[@]}" -y "$output"; then
+        ((++ok))
+    else
+        ((++fail))
+        printf '✗ 失败: %s\n' "$input" >&2
+    fi
+done
+
+printf '完成: 成功 %d, 失败 %d → %s\n' "$ok" "$fail" "$output_dir"
+fftools_log "image-batch: ok=$ok fail=$fail dir=$output_dir fmt=$fmt"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fzf-ffmpeg-batch:summary=批量转码：一次处理多个视频，自动选编码器和硬件加速。
+# fzf-ffmpeg-batch:summary=批量转码：一次处理多个视频；--queue 进入可跳过、可重试、可恢复的编码队列。
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -7,6 +7,228 @@ source "$script_dir/fzf-fftools-lib"
 
 require_tools ffmpeg ffprobe fzf || exit 1
 
+QUEUE_FILE="$FFTOOLS_STATE_DIR/queue.tsv"
+
+usage() {
+    cat <<'EOF'
+用法:
+  fzf-ffmpeg-batch [文件...]           批量转码（无参数时交互选择文件）
+  fzf-ffmpeg-batch --queue [文件...]   新建编码队列并逐个确认处理
+  fzf-ffmpeg-batch --resume            继续上次没跑完的队列
+  fzf-ffmpeg-batch --list              查看当前队列
+  fzf-ffmpeg-batch --clear             清空队列
+
+队列操作:
+  回车 = 开始当前任务   s = 跳过   q = 退出(任务保留)   a = 剩余全部自动
+EOF
+}
+
+# ── 统一编码入口：HDR 自动切 10-bit，fftools_run_live 实时进度 ──
+run_encode() {
+    local venc="$1" pix="$2" decode="$3" args_str="$4" input="$5" output="$6"
+    local -a dec_args=() enc_args args
+    [[ -n "$decode" ]] && dec_args=(-hwaccel "$decode")
+    read -r -a enc_args <<< "$args_str"
+
+    if detect_hdr "$input"; then
+        case "$venc" in
+            libx264)    pix=yuv420p10le ;;
+            h264_nvenc) pix=p010le ;;
+        esac
+    fi
+
+    args=(ffmpeg "${dec_args[@]}" -i "$input" -c:v "$venc" "${enc_args[@]}")
+    [[ -n "$pix" ]] && args+=(-pix_fmt "$pix")
+    args+=(-c:a aac -b:a 128k -y "$output")
+    fftools_run_live "${args[@]}"
+}
+
+# ── 交互选择编码设置（写入全局 venc/encode_args_str/pix_value/hw）──
+pick_settings() {
+    venc=$(fftools_pick_encoder) || exit 0
+    [[ -n "$venc" ]] || exit 0
+    fftools_encoder_setup "$venc"
+    encode_args_str="${ENCODE_ARGS[*]}"
+    pix_value=$PIX_VALUE
+    hw=$(fftools_choose_hwaccel) || true
+}
+
+# ── 输出目录（转为绝对路径，队列 --resume 换目录也能写对位置）──
+ask_output_dir() {
+    printf '输出目录 [%s/%s]: ' "$(pwd)" "$1"
+    read -r dir || true
+    [[ -z "$dir" ]] && dir="$PWD/$1"
+    [[ "$dir" == /* ]] || dir="$PWD/$dir"
+    mkdir -p -- "$dir"
+}
+
+# ── 输出重名追加序号，避免 -y 静默覆盖（含不同目录同名文件）──
+unique_output() {
+    local dir="$1" name="$2" out index=1
+    out="${dir}/${name%.*}_${venc}.mp4"
+    while [[ -e "$out" ]]; do
+        out="${dir}/${name%.*}_${venc}-${index}.mp4"
+        ((++index))
+    done
+    printf '%s\n' "$out"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 队列模式（状态: pending/done/skipped/failed）
+# ═══════════════════════════════════════════════════════════════
+declare -a Q_STATUS Q_IN Q_OUT Q_VENC Q_PIX Q_DECODE Q_ARGS
+
+save_queue() {
+    local decode pix
+    {
+        flock -x 9
+        : > "$QUEUE_FILE"
+        for (( j=0; j<${#Q_STATUS[@]}; j++ )); do
+            decode="${Q_DECODE[$j]}"; pix="${Q_PIX[$j]}"
+            # 空字段用占位符，避免 read 拆分时字段左移
+            [[ -n "$decode" ]] || decode=none
+            [[ -n "$pix" ]] || pix=none
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "${Q_STATUS[$j]}" "${Q_IN[$j]}" "${Q_OUT[$j]}" \
+                "${Q_VENC[$j]}" "$pix" "$decode" "${Q_ARGS[$j]}"
+        done
+    } 9> "$QUEUE_FILE.lock"
+}
+
+load_queue() {
+    local line status input output venc pix decode args
+    Q_STATUS=(); Q_IN=(); Q_OUT=(); Q_VENC=(); Q_PIX=(); Q_DECODE=(); Q_ARGS=()
+    [[ -f "$QUEUE_FILE" ]] || return 0
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        IFS=$'\t' read -r status input output venc pix decode args <<< "$line"
+        [[ "$decode" == none ]] && decode=""
+        [[ "$pix" == none ]] && pix=""
+        Q_STATUS+=("$status"); Q_IN+=("$input"); Q_OUT+=("$output")
+        Q_VENC+=("$venc"); Q_PIX+=("$pix"); Q_DECODE+=("$decode"); Q_ARGS+=("$args")
+    done < "$QUEUE_FILE"
+}
+
+run_task() {
+    local i="$1"
+    run_encode "${Q_VENC[$i]}" "${Q_PIX[$i]}" "${Q_DECODE[$i]}" \
+        "${Q_ARGS[$i]}" "${Q_IN[$i]}" "${Q_OUT[$i]}"
+}
+
+queue_loop() {
+    local total=${#Q_STATUS[@]}
+    local run_mode=ask i status name choice c
+    for (( i=0; i<total; i++ )); do
+        status="${Q_STATUS[$i]}"
+        [[ "$status" == pending || "$status" == failed ]] || continue
+        name=$(basename -- "${Q_IN[$i]}")
+
+        if [[ "$run_mode" == ask ]]; then
+            printf '\n[%d/%d] %s → %s\n' "$((i+1))" "$total" "$name" "$(basename -- "${Q_OUT[$i]}")"
+            read -r -p '回车=开始  s=跳过  q=退出  a=剩余全部自动: ' choice || true
+            case "$choice" in
+                s|S) Q_STATUS[$i]=skipped; save_queue; continue ;;
+                q|Q) save_queue; echo '已保存队列，可稍后用 --resume 继续'; exit 0 ;;
+                a|A) run_mode=auto ;;
+            esac
+        fi
+
+        if run_task "$i"; then
+            Q_STATUS[$i]=done
+        else
+            while :; do
+                Q_STATUS[$i]=failed
+                if [[ "$run_mode" == auto ]]; then
+                    break
+                fi
+                read -r -p '❌ 失败。 r=重试  s=跳过  q=退出: ' c || { save_queue; exit 0; }
+                case "$c" in
+                    r|R) ;;
+                    s|S) Q_STATUS[$i]=skipped; break ;;
+                    q|Q) save_queue; echo '已保存队列，可稍后用 --resume 继续'; exit 0 ;;
+                    *) continue ;;
+                esac
+                if run_task "$i"; then
+                    Q_STATUS[$i]=done
+                    break
+                fi
+            done
+        fi
+        save_queue
+    done
+
+    # ── 重试所有失败任务 ───────────────────────────────────
+    local attempts=0
+    local -a failed=()
+    while :; do
+        failed=()
+        for (( i=0; i<total; i++ )); do
+            [[ "${Q_STATUS[$i]}" == failed ]] && failed+=("$i")
+        done
+        (( ${#failed[@]} > 0 )) || break
+        (( attempts < 3 )) || { echo '重试次数已达上限，不再重试'; break; }
+        read -r -p "还有 ${#failed[@]} 个失败任务，全部重试？[y/N] " c || true
+        [[ "$c" == [yY]* ]] || break
+        for i in "${failed[@]}"; do
+            printf '[重试] %s\n' "$(basename -- "${Q_IN[$i]}")"
+            if run_task "$i"; then
+                Q_STATUS[$i]=done
+            else
+                Q_STATUS[$i]=failed
+            fi
+            save_queue
+        done
+        ((++attempts))
+    done
+
+    # ── 汇总 ───────────────────────────────────────────────
+    local done_n=0 failed_n=0 skipped_n=0 pending_n=0 s
+    for s in "${Q_STATUS[@]}"; do
+        case "$s" in
+            done)    ((++done_n)) ;;
+            failed)  ((++failed_n)) ;;
+            skipped) ((++skipped_n)) ;;
+            *)       ((++pending_n)) ;;
+        esac
+    done
+    printf '\n队列结束：成功 %d · 失败 %d · 跳过 %d · 未处理 %d\n' "$done_n" "$failed_n" "$skipped_n" "$pending_n"
+    echo "队列已保存：$QUEUE_FILE（--resume 继续，--clear 清空）"
+    fftools_log "queue: done=$done_n failed=$failed_n skipped=$skipped_n pending=$pending_n"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# 参数分发
+# ═══════════════════════════════════════════════════════════════
+mode=batch
+case "${1:-}" in
+    --queue)
+        mode=queue; shift ;;
+    --resume)
+        [[ -f "$QUEUE_FILE" ]] || { echo "没有保存的队列" >&2; exit 1; }
+        load_queue
+        queue_loop
+        exit 0 ;;
+    --list)
+        if [[ ! -f "$QUEUE_FILE" ]]; then
+            echo "队列为空"
+            exit 0
+        fi
+        load_queue
+        printf '状态\t输入\t输出\n'
+        for (( i=0; i<${#Q_STATUS[@]}; i++ )); do
+            printf '%s\t%s\t%s\n' "${Q_STATUS[$i]}" "$(basename -- "${Q_IN[$i]}")" "$(basename -- "${Q_OUT[$i]}")"
+        done
+        exit 0 ;;
+    --clear)
+        rm -f -- "$QUEUE_FILE"
+        echo "队列已清空"
+        exit 0 ;;
+    -h|--help)
+        usage
+        exit 0 ;;
+esac
+
+# ── 收集文件 ───────────────────────────────────────────
 if (( $# > 0 )); then
     mapfile -t files < <(printf '%s\n' "$@")
 else
@@ -15,23 +237,35 @@ else
 fi
 (( ${#files[@]} > 0 )) || exit 0
 
-venc=$(fftools_pick_encoder) || exit 0
-[[ -n "$venc" ]] || exit 0
+pick_settings
 
-# 编码器默认参数（预设 + 质量，从库里取）
-fftools_encoder_setup "$venc"
-encode_args=("${ENCODE_ARGS[@]}")
-pix_value=$PIX_VALUE
+mkdir -p -- "$FFTOOLS_STATE_DIR"
 
-# 硬件解码（可选）
-hw=$(fftools_choose_hwaccel) || true
-decode_args=()
-[[ -n "$hw" ]] && decode_args=(-hwaccel "$hw")
+if [[ "$mode" == queue ]]; then
+    ask_output_dir queue_out
+    Q_STATUS=(); Q_IN=(); Q_OUT=(); Q_VENC=(); Q_PIX=(); Q_DECODE=(); Q_ARGS=()
+    for f in "${files[@]}"; do
+        # 绝对路径，保证 --resume 在其他目录也能找到输入
+        [[ "$f" == /* ]] || f="$PWD/$f"
+        name=$(basename -- "$f")
+        out=$(unique_output "$dir" "$name")
+        Q_IN+=("$f")
+        Q_OUT+=("$out")
+        Q_VENC+=("$venc")
+        Q_PIX+=("$pix_value")
+        Q_DECODE+=("$hw")
+        Q_ARGS+=("$encode_args_str")
+        Q_STATUS+=(pending)
+    done
+    save_queue
+    queue_loop
+    exit 0
+fi
 
-printf '输出目录 [%s/batch_out]: ' "$(pwd)"
-read -r dir || true
-[[ -z "$dir" ]] && dir="${PWD}/batch_out"
-mkdir -p -- "$dir"
+# ═══════════════════════════════════════════════════════════════
+# 批量模式
+# ═══════════════════════════════════════════════════════════════
+ask_output_dir batch_out
 
 total=${#files[@]}
 ok=0
@@ -39,32 +273,15 @@ fail=0
 start_sec=$SECONDS
 for f in "${files[@]}"; do
     name=$(basename -- "$f")
-    # 不同目录同名文件追加序号，避免 -y 静默覆盖
-    output="${dir}/${name%.*}_${venc}.mp4"
-    if [[ -e "$output" ]]; then
-        index=1
-        while [[ -e "${dir}/${name%.*}_${venc}-${index}.mp4" ]]; do
-            ((++index))
-        done
-        output="${dir}/${name%.*}_${venc}-${index}.mp4"
-    fi
+    output=$(unique_output "$dir" "$name")
     count=$((ok + fail + 1))
 
-    # HDR 检测：8-bit 编码器自动切到 10-bit，避免色偏
-    pix_current=$pix_value
     if detect_hdr "$f"; then
-        case "$venc" in
-            libx264)    pix_current=yuv420p10le ;;
-            h264_nvenc) pix_current=p010le ;;
-        esac
-        printf '⚠️  [%d/%d] %s — HDR 视频，使用 10-bit 编码 (%s)\n' "$count" "$total" "$name" "$pix_current"
+        printf '⚠️  [%d/%d] %s — HDR 视频，使用 10-bit 编码\n' "$count" "$total" "$name"
     fi
 
     printf '[%d/%d] %s\n' "$count" "$total" "$name"
-    args=(ffmpeg "${decode_args[@]}" -i "$f" -c:v "$venc" "${encode_args[@]}")
-    [[ -n "$pix_current" ]] && args+=(-pix_fmt "$pix_current")
-    args+=(-c:a aac -b:a 128k -y "$output")
-    if fftools_run_live "${args[@]}"; then
+    if run_encode "$venc" "$pix_value" "$hw" "$encode_args_str" "$f" "$output"; then
         ((++ok))
     else
         ((++fail))

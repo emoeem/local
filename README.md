@@ -36,6 +36,7 @@
 | 编码器辅助 | `fftools_pick_encoder`（自动隐藏本机未编译的编码器）、`fftools_encoder_setup`、`pix_fmt`、`encoder_supports_2pass`、`fftools_advanced_args`（tune/无损）、`encode_2pass` |
 | 滤镜库 | `fftools_denoise / sharpen / interpolate / tmix / grain / deband / deinterlace / transpose / mpdecimate / eq / superres`（参数源自 3FUI 滤镜面板） |
 | 质量评测 | `fftools_metric_filter`（PSNR/SSIM/XPSNR/VMAF，支持 VMAF 模型与 pooling）、`fftools_vmaf_models`（自动发现本地模型） |
+| 翻译引擎 | `translate_timed / translate_lrc / translate_txt`（Ollama 批量请求 + 逐条回退，`fzf-generate-subs` 与 `fzf-translate-subs` 共用） |
 | 通用工具 | 进度条、运行日志、输出路径防覆盖、字幕路径转义、HDR 检测、硬件加速探测 |
 
 ## 转码工具
@@ -44,12 +45,10 @@
 |---|---|
 | `fzf-fftools` | 工具箱主菜单，聚合下面所有脚本（A~R 子命令） |
 | `fzf-convert-media` | 万能格式转换：视频/音频/图片自动识别，目标格式菜单（mp4/mkv/hevc/webm-vp9/avif/jxl/opus/flac…），输出重名自动追加序号 |
-| `fzf-compress-video` | 压缩视频：H.264/H.265、CRF 档位、缩放、画面增强（降噪/去色带/锐化/libplacebo 2x 超分）、EBU R128 音量标准化、HDR 自动 10-bit |
-| `fzf-ffmpeg-batch` | 批量转码：多选文件、统一编码器与硬件加速、HDR 自动 10-bit、重名输出防覆盖 |
-| `fzf-ffmpeg-queue` | 编码队列：一次排队逐个处理，支持跳过/重试/全部自动，中途退出可 `--resume` 继续；队列文件带 flock 锁，TSV 空字段占位防错位 |
+| `fzf-ffmpeg-batch` | 批量转码 + 编码队列：多选文件、统一编码器与硬件加速、HDR 自动 10-bit、重名输出防覆盖；`--queue` 排队逐个确认（可跳过/重试/全部自动），中途退出 `--resume` 继续，队列文件带 flock 锁 |
 | `fzf-speed-video` | 变速（atempo 链，自动处理 0.5~2.0 范围外倍速） |
 | `fzf-trim-video` | 剪辑：指定开始+持续，或**掐头去尾**（自动算保留区间）；无损拷贝或精确重编码 |
-| `fzf-ffmpeg-builder` | 手动拼 ffmpeg 命令：裁剪/缩放/帧率 + 全部滤镜菜单 + tune/无损高级选项 + 硬件解码 |
+| `fzf-ffmpeg-builder` | 手动拼 ffmpeg 命令：裁剪/缩放/帧率 + 全部滤镜菜单 + tune/无损高级选项 + 硬件解码 + EBU R128 音量标准化 |
 | `fzf-ffmpeg-color` | 色彩转换：HDR10→SDR（hable tonemap）、SDR→HDR10（含 master-display 写入）、bt709↔bt2020、仅写 HDR 元数据（bsf） |
 | `fzf-ffmpeg-preset` | 预设快速压制：内置 3FUI 官方配方 + 用户预设目录，见[预设系统](#预设系统) |
 
@@ -60,14 +59,12 @@
 | `fzf-generate-subs` | Whisper 生成字幕：模型选择、VAD、翻译成目标语言、双语输出；支持 SRT/VTT/LRC/TXT；生成后可接烧录或封装 |
 | `fzf-translate-subs` | AI 翻译已有字幕（本地 Ollama）：批量请求、逐条回退保证正确性、SRT/VTT/LRC/TXT、可选双语保留原文 |
 | `fzf-burn-subs` | 烧录字幕进画面：字体库扫描推荐（中文字体加权评分）、字号选择、force_style |
-| `fzf-subtitles` | 抽取/封装/烧录字幕，封装按容器自动选 mov_text/webvtt/srt |
-| `fzf-ai-subtitles` | 生成+翻译一条龙入口 |
 
 ## 音频与图片
 
 | 脚本 | 功能 |
 |---|---|
-| `fzf-extract-audio` | 从视频抽音轨（m4a/mp3/opus/wav/ogg），输出同名防覆盖 |
+| `fzf-image-batch` | 批量图片（类 Converseen）：多选图片统一转换格式（jpg/webp/png/avif/jxl/tiff/bmp）+ 缩放（百分比/最长边/指定宽高），质量分档、输出防覆盖 |
 | `fzf-audio-tools` | 批量：EBU R128 音量标准化（输出 m4a）/转 Opus/AAC/提取封面 |
 | `fzf-mute-video` | 批量去音轨（流复制，不重编码） |
 | `fzf-video-to-gif` | 高质量 GIF：palettegen/paletteuse 双通道、dither=bayer、尺寸与帧率可选 |
@@ -145,7 +142,7 @@ build_atempo_chain <倍速>                                        # 变速滤�
 
 - 运行日志：`~/.local/state/fzf-fftools/logs/`（每次 ffmpeg 调用完整落盘）
 - 任务日志：`~/.local/state/fzf-fftools/tasks.log`
-- 编码队列：`~/.local/state/fzf-fftools/queue.tsv`（`--list` 查看 / `--clear` 清空）
+- 编码队列：`~/.local/state/fzf-fftools/queue.tsv`（`fzf-ffmpeg-batch --list` 查看 / `--clear` 清空）
 - 预览缓存：`~/.cache/fzf-media-preview`（主菜单 `Q` 可清理/按 30 天修剪）
 - 字体缓存：`~/.cache/fzf-fftools/fonts.tsv`
 

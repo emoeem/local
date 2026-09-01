@@ -174,6 +174,13 @@ case "$aenc" in
     *)    cmd+=(-c:a "$aenc") ;;
 esac
 
+# 音量标准化（EBU R128，仅重编码音频时有意义）
+if [[ "$aenc" != copy && "$aenc" != -an && -n "$aenc" ]]; then
+    norm=$(printf '%s\n' '不标准化' '标准化音量 (EBU R128, -16 LUFS)' \
+        | fzf "${FZF_BASE[@]}" --height 25% --header '音频响度') || exit 0
+    [[ "$norm" == 标准化* ]] && cmd+=(-af "$(loudnorm_filter)")
+fi
+
 cmd+=(-y "$out")
 
 # 使用 confirm_run_cmd 避免字符串拼接引号问题

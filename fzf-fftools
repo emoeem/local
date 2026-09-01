@@ -25,7 +25,7 @@ OPS=(
     "3. 裁剪片段      fzf-trim-video          剪掉一段，快速或精确"
     "4. 抽流          fzf-extract-streams     抽出视频/音轨/字幕/附件"
     "5. 混流          fzf-mux-media           把画面声音字幕装进一个文件"
-    "6. 提取音频      fzf-extract-audio       把声音单独存出来"
+    "6. 批量图片      fzf-image-batch         批量转换格式/缩放尺寸"
     "7. 移除音频      fzf-mute-video          去掉声音"
     "8. 合并音视频    fzf-merge-av            自动配对视频+音频并合并"
     "9. 拼接视频      fzf-concat-video        多个视频按顺序接成一个"
@@ -40,13 +40,13 @@ OPS=(
     "I. 添加水印      fzf-add-watermark       加文字或图片水印"
     "J. 媒体浏览      __browse_media          看图/视频帧/音频封面"
     "K. Yazi工作台    __yazi_media            文件管理器"
-    "L. AI字幕        fzf-ai-subtitles        Whisper 生成或 AI 翻译"
-    "M. 字幕工具      fzf-subtitles           抽取、封装、烧录字幕"
+    "L. AI生成字幕    fzf-generate-subs       Whisper自动生成字幕"
+    "M. AI翻译字幕    fzf-translate-subs      Ollama翻译已有字幕"
     "N. 音频工具      fzf-audio-tools         标准化音量、转码、封面"
     "O. 媒体分析      __analyze_media         查看编码、HDR、音轨"
     "P. 环境诊断      __doctor                检查依赖与编码器"
     "Q. 预览缓存      __cache                 清理预览缓存"
-    "R. 编码队列      fzf-ffmpeg-queue        排队处理，可跳过、可重试"
+    "R. 编码队列      __queue                 排队处理，可跳过、可重试"
 )
 
 while true; do
@@ -79,6 +79,10 @@ while true; do
     elif [[ "$CMD" == "__cache" ]]; then
         choice=$(printf '%s\n' 'status' 'prune (清理30天前缓存)' 'clear (清空全部缓存)' | fzf --height 30% --header '预览缓存') || continue
         fftools_cache "${choice%% *}"
+    elif [[ "$CMD" == "__queue" ]]; then
+        "$script_dir/fzf-ffmpeg-batch" --queue
+        echo
+        read -r -p "按 Enter 返回菜单..."
     elif [[ -x "$script_dir/$CMD" ]]; then
         "$script_dir/$CMD"
         echo
